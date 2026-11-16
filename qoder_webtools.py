@@ -1,4 +1,4 @@
-"""Web 工具代跑：默认本地，可显式选择已认证的 Qoder CN 官方后端。
+"""Web 工具代跑：默认本地，可选择 Qoder 官方（CN / 国际版）或外部搜索后端。
 
 为什么需要：Codex 等客户端会声明内置工具（type=web_search / web_fetch），
 Qoder 上游只认 function 类型，这类声明此前被直接丢弃（#63）——客户端以为有

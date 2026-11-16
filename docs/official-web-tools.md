@@ -1,19 +1,26 @@
-# Qoder CN 官方 Web 工具协议与验证
+# Qoder 官方 Web 工具协议与验证（国内版 / 国际版）
 
-此记录来自 Qoder CLI CN 1.1.89 分发包的静态请求链分析，以及 2026-11-16 使用自有有效 CN 账号的联网验证。Qoder 是闭源项目，可分析分发的压缩 JavaScript 不等于取得源码仓库或服务端实现。这里只记录互操作协议，不携带账号凭据、官方客户端代码或 WASM 二进制。
+此记录来自 Qoder CLI 和 CLI CN 1.1.89 分发包的静态请求链分析，以及 2026-11-16 使用自有有效国内版、国际版账号的联网验证。Qoder 是闭源项目，可分析分发的压缩 JavaScript 不等于取得源码仓库或服务端实现。这里只记录互操作协议，不携带账号凭据、官方客户端代码或 WASM 二进制。
 
-分析包 SHA256：`eb9d1d6ab7dbdf00c7f14706419b030747aff4e27339b6f146a99e46ff212196`。沿工具声明 → 调用处理 → 服务对象 → HTTP transport 阅读调用链，观察参数、认证、响应解析与客户端后处理；未绕过认证。
+分析的 JavaScript SHA256：CN 为 `eb9d1d6ab7dbdf00c7f14706419b030747aff4e27339b6f146a99e46ff212196`，国际版为 `b7a2d6d54bf868f7226abc759c10c6361ea4ab04ddd4c0615eb90ccef3524377`。国际版从[官方 npm 发行包](https://registry.npmjs.org/@qoder-ai/qodercli/1.1.89)提取，完整 tarball 已核对 npm SHA512 integrity；CN 对应[同版本发行包](https://registry.npmjs.org/@qodercn-ai/qoderclicn/1.1.89)。沿工具声明 → 调用处理 → 服务对象 → HTTP transport 阅读调用链，观察参数、认证、响应解析与客户端后处理；未绕过认证。
 
 ## 请求链
 
-官方客户端的 `webSearch.search` 请求依次经过登录检查、Bearer、WASM 签名及 HTTP transport。公网 CN 的 `webSearch` / `center` 端点均为 `https://gateway.qoder.com.cn`。
+官方客户端的 `webSearch.search` 请求依次经过登录检查、Bearer、WASM 签名及 HTTP transport。两版客户端的搜索、抓取实现及端点表逐字相同，通过区域标志选择主机：
+
+| 区域 | WebSearch / WebFetch 的公网端点 |
+|---|---|
+| 国内版（CN） | `https://gateway.qoder.com.cn`，沿用当前账号的 gateway 配置 |
+| 国际版（INTL） | `https://center.qoder.sh`，与 `api1/api2/api3.qoder.sh` 推理服务分开 |
+
+国际版当前使用已验证的默认 center 地址，不进行官方客户端的动态 center 选址；`QD_INTL_GATEWAY` 不覆盖工具地址。不能仅删除区域限制后继续复用国际版推理主机。
 
 | 工具 | 方法与路径 | 内层参数 |
 |---|---|---|
 | WebSearch | `POST /algo/api/v1/webSearch/oneSearch?Encode=1` | `query`、`timeRange: NoLimit`、`contents: {mainText:false, markdownText:false, summary:false}` |
 | WebFetch | `POST /algo/api/v1/webFetch?Encode=1` | `url`、`maxAge:0`、`timeout:14000`、`formats:[markdown]` |
 
-客户端另外存在 `unifiedSearch` 分支，由 Lingma / Aliyun 集成模式选择；本实现只使用已验证的 Qoder 公网 CN `oneSearch` 路径。
+客户端另外存在 `unifiedSearch` 分支，由 Lingma / Aliyun 集成模式选择，并非国内版 / 国际版开关；本实现使用两个区域均已验证的 Qoder 公网 `oneSearch` 路径。
 
 内层参数先转为 JSON 字符串，再放入外层：
 
@@ -40,7 +47,7 @@ HTTP 错误、业务 `errorCode`、结构异常和空正文都不能伪装成成
 - 官方 CLI 的 `createSearchResult` 会在客户端再次检查域名，精确主机或子域匹配；对 `allowed_domains:[docs.python.org]` 的上游单次实测仍返回其他域名。因此本实现也在网关过滤，不能仅依赖请求参数。应用级过滤同时约束抓取的输入及返回最终地址；模型只能进一步缩小范围。
 - 官方客户端 `formatResults` 包含标题、链接、摘要、发布时间、最多 10 条结果和强制来源链接提醒。本实现复用数据结构，默认最多 5 条，不照搬强制提醒。其他集成的搜索分支不视为当前账号可用能力。客户端证据不能证明服务端搜索源或排序算法。
 - 官方搜索当次结果包含第三方 SEO 页面，不能据此承诺搜索质量或事实准确性。
-- 未验证国际版、VPC、额外工具收费规则、权限变更与所有站点抓取兼容性。
+- 两个区域均已验证搜索和网页抓取。企业 VPC、额外工具收费规则、权限变更与所有站点抓取兼容性未验证。
 - 搜索 / 抓取与大模型推理是分开的工具请求；Responses 事件由网关生成，不会增加模型厂商云端 Agent 状态。
 
 ## 验证方法
@@ -58,9 +65,10 @@ python tests/run_all.py --jobs 2
 ```bash
 python scripts/probe_official_web.py --accounts-dir /path/to/accounts --query 'Python asyncio TaskGroup'
 python scripts/probe_official_web.py --accounts-dir /path/to/accounts --url https://docs.python.org/3/library/asyncio-task.html
+python scripts/probe_official_web.py --accounts-dir /path/to/accounts --realm intl --query 'Python asyncio TaskGroup'
 ```
 
-多个账号时必须通过 `--account UID` 明确选择。脚本仅读取现有登录，不刷新、不保存或打印 Token；输出仅含成功状态、条目数或正文字符数，不向模型发起推理请求。
+可用 `--realm cn` / `--realm intl` 筛选账号；筛选后仍有多个账号时必须通过 `--account UID` 明确选择。脚本仅读取现有登录，不刷新、不保存或打印 Token；输出仅含账号区域、成功状态、条目数或正文字符数，不向模型发起推理请求。
 
 ## 面向通用应用的协议适配
 
@@ -91,6 +99,12 @@ python scripts/probe_official_web.py --accounts-dir /path/to/accounts --url http
 - 12 组学术查询中，增加官方站点限定改善了来源域名，但不保证命中具体论文。已知 NeurIPS、CVPR、JMLR 页面可读；部分 OpenReview、AAAI 页面返回验证页面；IEEE、ACM 及部分 arXiv 抓取失败。
 - 限定域名和准确标题不能消除索引缺失、排序、反爬及返回条目上限的影响。当前实现尚未自动识别所有反爬验证页面。
 - Tavily、Brave、Serper 使用本地 HTTP 协议桩验证，尚未使用真实服务密钥联测。SearXNG、原内置后端和官方 CN 后端均已取得实际搜索结果。
+
+上述外站及论文抽样使用 CN 账号。国际版后续单次探测另有以下结果，不应将一方的覆盖范围套用到另一方：
+
+- Python TaskGroup 搜索返回 5 条结果，官方文档排第一；该页面抓取成功，正文裁剪至 20000 字符。
+- Reuters 站内搜索返回 5 条 Reuters 域名链接；X/NVIDIA 站内搜索返回主页及具体推文链接，但 X 主页抓取仍无可读正文。这不证明具体新闻断言正确，也不保证任意外站均可访问。
+- 测试账号由用户报告无可用模型额度，但工具调用仍成功；未核对独立工具账单，不能认定永久免费。国际版测试只调用独立工具，未验证无额度情况下的模型推理或完整模型多轮回灌。
 
 ## 工具边界与后端选择
 

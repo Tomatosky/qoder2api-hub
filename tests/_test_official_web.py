@@ -1,9 +1,10 @@
-"""Offline protocol, isolation and handler tests for official CN web tools."""
+"""Offline protocol, realm isolation and handler tests for official web tools."""
 import contextlib
 import hashlib
 import io
 import json
 import os
+import runpy
 import sys
 import tempfile
 import unittest
@@ -24,11 +25,12 @@ import qoder_webtools as W
 from qoder_sign import qoder_decode
 
 
-def account(uid="test-one", realm="cn", vpc=False):
+def account(uid="test-one", realm="cn", vpc=False, gateway=None):
     return SimpleNamespace(
-        uid=uid, access_token="test-secret-" + uid, realm=realm,
+        uid=uid, access_token="test-secret-" + realm + "-" + uid, realm=realm,
         realm_config=lambda: {
-            "gateway": "https://gateway.qoder.com.cn",
+            "gateway": gateway if gateway is not None else (
+                "https://api3.qoder.sh" if realm == "intl" else "https://gateway.qoder.com.cn"),
             "vpc_instance": "private-instance" if vpc else "",
         },
     )
@@ -78,11 +80,75 @@ class OfficialWebTests(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], 15)
 
     def test_missing_other_realm_and_vpc_rejected_without_network(self):
-        for acc in [None, account(realm="intl"), account(vpc=True),
+        for acc in [None, account(realm="unknown"), account(vpc=True),
+                    account(realm="intl", vpc=True),
                     SimpleNamespace(access_token="")]:
             with self.subTest(acc=acc):
                 self.assertFalse(O.search(acc, "query")["ok"])
         self.http.assert_not_called()
+
+    def test_intl_search_uses_center_and_signs_encoded_body(self):
+        acc = account(realm="intl", gateway="https://inference.example.com")
+        self.assertTrue(O.search(acc, "query")["ok"])
+        url = self.http.call_args.args[0]
+        kwargs = self.http.call_args.kwargs
+        self.assertEqual(url, "https://center.qoder.sh" + O.SEARCH_PATH + "?Encode=1")
+        envelope = json.loads(qoder_decode(kwargs["data"].decode("ascii")))
+        self.assertEqual(json.loads(envelope["payload"])["query"], "query")
+        headers = kwargs["headers"]
+        prefix, signature = headers["authorization"].rsplit(".", 1)
+        signed = "\n".join([prefix[len("Bearer COSY."):], headers["cosy-key"],
+                            headers["cosy-date"], kwargs["data"].decode("ascii"),
+                            O.SEARCH_PATH[5:]])
+        self.assertEqual(signature, hashlib.md5(signed.encode()).hexdigest())
+        self.assertEqual(headers["cosy-user"], acc.uid)
+
+    def test_cn_gateway_scope_is_preserved(self):
+        self.assertTrue(O.search(account(gateway="https://cn-gateway.example.com/"), "query")["ok"])
+        self.assertEqual(self.http.call_args.args[0],
+                         "https://cn-gateway.example.com" + O.SEARCH_PATH + "?Encode=1")
+
+    def test_invalid_cn_gateway_rejected_before_signing_or_transport(self):
+        for origin in ("http://gateway.qoder.com.cn", "https://user:pass@example.com",
+                       "https://example.com/path", "https://example.com?query=1", ""):
+            with self.subTest(origin=origin), mock.patch.object(O.SESSIONS, "get") as signer:
+                self.assertFalse(O.search(account(gateway=origin), "query")["ok"])
+                signer.assert_not_called()
+        self.http.assert_not_called()
+
+    def test_same_uid_in_different_realms_keeps_the_callers_credentials(self):
+        for realm, origin in (("cn", "https://gateway.qoder.com.cn"),
+                              ("intl", "https://center.qoder.sh"),
+                              ("cn", "https://gateway.qoder.com.cn")):
+            acc = account("shared-uid", realm=realm)
+            with self.subTest(realm=realm), mock.patch.object(O.SESSIONS, "get", wraps=O.SESSIONS.get) as signer:
+                self.assertTrue(O.search(acc, "query")["ok"])
+                signer.assert_called_once_with(acc)
+                self.assertEqual(self.http.call_args.args[0], origin + O.SEARCH_PATH + "?Encode=1")
+                self.assertEqual(O.SESSIONS.get(acc).access_token, acc.access_token)
+
+    def test_intl_auth_failure_has_no_cross_realm_or_local_fallback(self):
+        acc = account(realm="intl")
+        self.http.side_effect = urllib.error.HTTPError(
+            "https://center.qoder.sh/x", 401, acc.access_token, {},
+            io.BytesIO(acc.access_token.encode()))
+        with mock.patch.object(W, "search") as local:
+            output = W.run_tool("web_search", '{"query":"test"}', account=acc)
+        self.assertIn("HTTP 401", output)
+        self.assertNotIn(acc.access_token, output)
+        self.assertEqual(self.http.call_count, 1)
+        self.assertEqual(self.http.call_args.args[0], "https://center.qoder.sh" + O.SEARCH_PATH + "?Encode=1")
+        local.assert_not_called()
+
+    def test_intl_fetch_uses_center_and_original_account(self):
+        acc = account(realm="intl")
+        self.http.return_value = {"results": [{"statusCode": 200, "markdown": "Readable page"}]}
+        with mock.patch.object(W, "check_url", return_value=(True, "")):
+            result = O.fetch(acc, "https://example.com/page")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["text"], "Readable page")
+        self.assertEqual(self.http.call_args.args[0], "https://center.qoder.sh" + O.FETCH_PATH + "?Encode=1")
+        self.assertEqual(self.http.call_args.kwargs["headers"]["cosy-user"], acc.uid)
 
     def test_query_validation_before_network(self):
         for query in ["", "   ", "x" * (O.MAX_QUERY_CHARS + 1)]:
@@ -199,7 +265,8 @@ class OfficialWebTests(unittest.TestCase):
                 W.run_tool("web_search", '{"query":"hi"}', self.acc)
         self.http.assert_not_called()
 
-    def test_real_handler_passes_inference_account_and_refeeds_result(self):
+    def _assert_handler_passes_inference_account_and_refeeds_result(self, realm):
+        self.acc = account(realm=realm)
         call = {"id": "call_search", "type": "function", "function": {
             "name": "web_search", "arguments": '{"query":"test"}'}}
         responses = [{"choices": [{"message": {"content": "", "tool_calls": [call]}}]},
@@ -214,7 +281,7 @@ class OfficialWebTests(unittest.TestCase):
         handler.headers = {}
         handler.key_entry = None
         handler._model_precheck = lambda *args: None
-        handler._request_realm = lambda: "cn"
+        handler._request_realm = lambda: realm
         handler._key_id_for_usage = lambda: "test-key"
         handler._json = lambda status, result: (status, result)
         with mock.patch.object(P, "open_upstream", side_effect=open_upstream), \
@@ -230,6 +297,47 @@ class OfficialWebTests(unittest.TestCase):
         self.assertIn("https://example.com/docs", tools[0]["content"])
         self.assertEqual(self.http.call_args.kwargs["headers"]["cosy-user"], self.acc.uid)
         self.assertEqual(result["choices"][0]["message"]["content"], "Done")
+
+    def test_real_handler_passes_inference_account_and_refeeds_result(self):
+        for realm, origin in (("cn", "https://gateway.qoder.com.cn"),
+                              ("intl", "https://center.qoder.sh")):
+            with self.subTest(realm=realm):
+                self._assert_handler_passes_inference_account_and_refeeds_result(realm)
+                self.assertEqual(self.http.call_args.args[0], origin + O.SEARCH_PATH + "?Encode=1")
+
+    def test_live_probe_selects_realm_without_exposing_credentials(self):
+        probe = runpy.run_path(os.path.join(ROOT, "scripts", "probe_official_web.py"))
+        with tempfile.TemporaryDirectory() as tmp:
+            for realm in ("cn", "intl"):
+                with open(os.path.join(tmp, realm + ".json"), "w", encoding="utf-8") as f:
+                    json.dump({"uid": "probe-" + realm, "realm": realm,
+                               "accessToken": "private-probe-token-" + realm}, f)
+            for realm in ("cn", "intl"):
+                with self.subTest(realm=realm), mock.patch.object(
+                        O, "search", return_value={"ok": True, "results": []}) as search:
+                    stdout = io.StringIO()
+                    with mock.patch.object(sys, "argv", ["probe", "--accounts-dir", tmp,
+                            "--realm", realm, "--query", "test"]), contextlib.redirect_stdout(stdout):
+                        self.assertEqual(probe["main"](), 0)
+                    selected = search.call_args.args[0]
+                    self.assertEqual(selected.realm, realm)
+                    self.assertEqual(selected.access_token, "private-probe-token-" + realm)
+                    self.assertEqual(json.loads(stdout.getvalue())["realm"], realm)
+                    self.assertNotIn(selected.access_token, stdout.getvalue())
+                    self.assertNotIn(selected.uid, stdout.getvalue())
+
+    def test_live_probe_keeps_ambiguous_accounts_explicit(self):
+        probe = runpy.run_path(os.path.join(ROOT, "scripts", "probe_official_web.py"))
+        with tempfile.TemporaryDirectory() as tmp:
+            for realm in ("cn", "intl"):
+                with open(os.path.join(tmp, realm + ".json"), "w", encoding="utf-8") as f:
+                    json.dump({"uid": realm, "realm": realm, "accessToken": "fake-token"}, f)
+            with mock.patch.object(sys, "argv", ["probe", "--accounts-dir", tmp,
+                    "--query", "test"]), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(O, "search") as search, self.assertRaises(SystemExit) as exc:
+                probe["main"]()
+            self.assertEqual(exc.exception.code, 2)
+            search.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -8271,7 +8271,7 @@ function updateWebToolsBackend(){
   document.getElementById('setWebExternal').style.display = backend === 'external' ? '' : 'none';
   document.getElementById('setWebToolsBackendHelp').textContent = {
     local:'使用原项目内置引擎链搜索，网页由网关直接抓取。',
-    qoder:'搜索和网页抓取使用当前推理账号的 Qoder 官方服务，目前支持公网 CN 账号。',
+    qoder:'搜索和网页抓取使用当前推理账号的 Qoder 官方服务，支持国内版和国际版公网账号，自动选择对应区域端点。',
     external:'搜索交给所选外部服务，网页由网关直接抓取。各服务配置分别保存，切换不会互相覆盖密钥。'
   }[backend] || '';
 }

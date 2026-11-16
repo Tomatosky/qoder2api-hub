@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 20
+    "version": 21
   },
   "messages": {
     "国内版服务入口": "China service endpoint",
@@ -864,7 +864,7 @@
     "其他固定参数不是有效 JSON，请先修正": "Fixed parameters contain invalid JSON; correct them first",
     "联网工具设置已保存，新请求立即生效": "Web tool settings saved; effective for new requests",
     "使用原项目内置引擎链搜索，网页由网关直接抓取。": "Search uses the built-in engine chain; the gateway fetches pages directly.",
-    "搜索和网页抓取使用当前推理账号的 Qoder 官方服务，目前支持公网 CN 账号。": "Search and page fetch use the current inference account with Qoder services. Public CN accounts are supported.",
+    "搜索和网页抓取使用当前推理账号的 Qoder 官方服务，支持国内版和国际版公网账号，自动选择对应区域端点。": "Search and page fetch use the current inference account with Qoder services. Public China and International accounts are supported; the endpoint follows the account's realm.",
     "搜索交给所选外部服务，网页由网关直接抓取。各服务配置分别保存，切换不会互相覆盖密钥。": "The selected service searches, and the gateway fetches pages directly. Provider profiles and keys are saved separately.",
     "代跑客户端声明的内置": "Execute the client-declared built-in",
     "。可选原项目内置的本地 web 工具、Qoder 官方服务或外部搜索服务。": ". Choose the built-in tools, official Qoder services, or an external search service.",

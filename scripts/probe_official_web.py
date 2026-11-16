@@ -14,6 +14,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--accounts-dir", required=True)
     parser.add_argument("--account", help="Existing account UID; required if more than one matches")
+    parser.add_argument("--realm", choices=("cn", "intl"), help="Limit selection to one account realm")
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--query")
     action.add_argument("--url")
@@ -30,16 +31,18 @@ def main():
         if (isinstance(data, dict) and data.get("accessToken")
                 and data.get("enabled", True)
                 and (not args.account or data.get("uid") == args.account)):
-            accounts.append(Account(data))
+            account = Account(data)
+            if not args.realm or account.realm == args.realm:
+                accounts.append(account)
     if len(accounts) != 1:
         parser.error("select exactly one enabled account with --account UID")
     if args.query is not None:
         result = official.search(accounts[0], args.query)
-        summary = {"operation": "search", "ok": result["ok"],
+        summary = {"operation": "search", "realm": accounts[0].realm, "ok": result["ok"],
                    "results": len(result.get("results") or [])}
     else:
         result = official.fetch(accounts[0], args.url)
-        summary = {"operation": "fetch", "ok": result["ok"],
+        summary = {"operation": "fetch", "realm": accounts[0].realm, "ok": result["ok"],
                    "characters": len(result.get("text") or "")}
     if not result["ok"]:
         summary["error"] = result.get("error")

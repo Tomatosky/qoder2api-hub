@@ -296,7 +296,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 
 预设协议参考：[SearXNG](https://docs.searxng.org/dev/search_api.html)、[Tavily](https://docs.tavily.com/documentation/api-reference/endpoint/search)、[Brave Search](https://api-dashboard.search.brave.com/api-reference/web/search/get)、[Serper](https://serper.dev/)。服务的可用性、密钥和用量规则由对应服务决定。
 
-### 可选的 Qoder CN 官方搜索 / 网页抓取
+### 可选的 Qoder 官方搜索 / 网页抓取（国内版 / 国际版）
 
 ```bash
 QD_WEB_TOOLS=on QD_WEB_TOOLS_BACKEND=qoder python qoder_proxy.py
@@ -305,10 +305,12 @@ QD_WEB_TOOLS=on QD_WEB_TOOLS_BACKEND=qoder python qoder_proxy.py
 也可直接通过面板选择「Qoder 官方搜索与抓取」并启用总开关。Docker Compose 的环境变量方式适合需要强制固定后端的部署。需要包含新增工具模块的源码或镜像；仅设置旧镜像的环境变量不会新增功能。
 
 - 复用**当前这轮模型推理实际选中的账号**及其 COSY 签名。不会另选账号、跨区借用凭据，也不需要额外搜索 API Key、Node 或官方 CLI 进程。
-- 当前只支持公网 CN 账号；国际版和企业 VPC 未验证，显式报错。已有登录过期或官方服务拒绝请求时也返回工具错误，不会静默切换本地搜索。
+- 支持国内版和国际版公网账号，按当前推理账号的区域自动选择端点：国内版使用账号的 `gateway`，国际版使用 `https://center.qoder.sh`。国际版的 `QD_INTL_GATEWAY` 只覆盖推理地址，不改变官方工具地址；两个区域不互相借用账号或自动回退。
+- 企业 VPC 工具尚未验证，显式报错。已有登录过期或官方服务拒绝请求时也返回工具错误，不会静默切换本地搜索。
 - 查询和抓取 URL 会发送给 Qoder 官方服务；连接沿用账号模块的 `HTTP_PROXY` / `HTTPS_PROXY` 策略。
 - 抓取前执行本地 URL / DNS 公网检查，正文最多返回 20000 字。服务端返回的最终重定向 URL 也会检查；**远端中间重定向无法由网关逐跳审计**，不能套用本地后端的逐跳连接保证。
 - 官方搜索返回的是 Qoder 工具服务结果，不等于模型服务商原生搜索，也不保证比本地引擎结果更好。额外搜索 / 抓取是否收费、按何规则计费，以官方账号规则为准；网关没有得到独立工具用量字段。
+- 实测一个用户报告无可用模型额度的国际版账号仍能搜索和抓取；这不能证明工具免费，也不绕过模型推理的额度要求。网关仍使用实际选中的推理账号执行工具，不另选“搜索专用”账号。
 - 本功能只代跑客户端声明的内置 `web_search` / `web_fetch`。WebUI、Hermes 等自行执行的普通 function 工具仍由客户端处理，不会因设置这个变量自动改用官方搜索。
 
 Responses 客户端仅需声明 `web_search`，即可搜索和打开网页：

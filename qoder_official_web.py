@@ -1,6 +1,6 @@
-"""Opt-in Qoder CN web tools using the caller's existing authenticated account.
+"""Opt-in Qoder web tools using the caller's existing CN or INTL account.
 
-Protocol observed in Qoder CLI CN 1.1.89. This is a tool backend, not a
+Protocol observed in Qoder CLI and CLI CN 1.1.89. This is a tool backend, not a
 model-provider-native search API. No CLI process, WASM binary or new dependency
 is needed: qoder_sign already implements the required encoding and COSY signing.
 """
@@ -14,6 +14,7 @@ from qoder_web_response import clean_text, domains, matches_domain, public_link
 
 SEARCH_PATH = "/algo/api/v1/webSearch/oneSearch"
 FETCH_PATH = "/algo/api/v1/webFetch"
+INTL_WEB_ORIGIN = "https://center.qoder.sh"
 MAX_QUERY_CHARS = 2048
 MAX_RESULTS = 5
 MAX_FETCH_CHARS = 20000
@@ -26,13 +27,17 @@ class OfficialWebError(Exception):
 def _request(account, path, payload):
     if account is None or not getattr(account, "access_token", ""):
         raise OfficialWebError("official web tools require an authenticated account")
-    if getattr(account, "realm", "") != "cn":
-        raise OfficialWebError("official web tools currently support CN accounts only")
+    realm = getattr(account, "realm", "")
+    if realm not in ("cn", "intl"):
+        raise OfficialWebError("official web tools require a CN or INTL account")
     cfg = qoder_accounts.account_realm_config(account)
     if cfg.get("vpc_instance"):
         raise OfficialWebError("official web tools have not been verified for VPC accounts")
-    # Use the account's endpoint scope; never select another account or realm.
-    origin = str(cfg.get("gateway") or "").rstrip("/")
+    # CN tools share the account's gateway. INTL tools use the center service,
+    # independently of api1/api2/api3 or QD_INTL_GATEWAY inference overrides.
+    # Keep the caller's account; never borrow credentials or retry in another realm.
+    origin = (str(cfg.get("gateway") or "").rstrip("/") if realm == "cn"
+              else INTL_WEB_ORIGIN)
     parsed = urllib.parse.urlsplit(origin)
     if (parsed.scheme != "https" or not parsed.hostname
             or parsed.username is not None or parsed.password is not None
