@@ -4235,6 +4235,20 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
         <button class="sec" onclick="panelLogout()">退出面板登录</button>
       </div>
     </section>
+
+    <section id="sectionShutdown">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">关闭网关 <em id="setShutdownState"></em></h2>
+          <ul style="font-size:12px;color:var(--dim);margin:6px 0 0;padding-left:18px;line-height:1.8">
+            <li>停止当前网关进程（等价于 stop 脚本）。</li>
+            <li>只接受本机且已登录面板的请求；QD_SHUTDOWN_DISABLE=1 可一键禁用。</li>
+            <li>停止后需用启动脚本重新拉起，正在转发的请求可能被中断。</li>
+          </ul>
+        </div>
+        <button class="danger" id="btnShutdown" onclick="shutdownGateway(this)">关闭网关</button>
+      </div>
+    </section>
   </div>
 
   <div id="pageLogs" class="main-page">
@@ -8157,10 +8171,71 @@ async function loadSettings(showToast){
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
     renderLimits(data.limits || null);   // 后端 GET /settings 带回 limits 时才允许保存（见 saveLimits 的护栏）
+    renderShutdownState(data.shutdown || null);
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
   }
+}
+
+// —— 面板关闭网关 ——
+// 后端 GET /settings 的 shutdown 块给出 can_shutdown / blocked_reasons：
+// 必然失败的按钮不渲染（与「一键更新」的 can_apply 门控同一原则，issue #132）。
+let SHUTDOWN_STATE = null;
+function renderShutdownState(info){
+  SHUTDOWN_STATE = info || null;
+  const state = document.getElementById('setShutdownState');
+  const btn = document.getElementById('btnShutdown');
+  if(!info){
+    if(state) state.textContent = '';
+    if(btn){ btn.disabled = true; btn.style.display = 'none'; }
+    return;
+  }
+  // blocked_codes 是本前端自己的文案（可被 i18n 包逐字命中）；
+  // blocked_reasons 是后端权威中文，code 认不出时才回退到它。
+  const REASONS = {
+    disabled: '已禁用（QD_SHUTDOWN_DISABLE=1）',
+    no_listener: '当前进程未持有监听器（可能是测试或子进程）',
+  };
+  const codes = (info.blocked_codes || []);
+  const why = codes.length
+    ? codes.map(c => REASONS[c] || c)
+    : (info.blocked_reasons || []).filter(Boolean);
+  const can = info.can_shutdown === true;
+  if(state){
+    state.textContent = can ? '(可用)' : '(不可用：' + (why.length ? why.join('；') : '未说明原因') + ')';
+    state.style.color = can ? 'var(--dim)' : 'var(--warn)';
+  }
+  if(btn){
+    btn.style.display = can ? '' : 'none';
+    btn.disabled = !can;
+  }
+}
+
+async function shutdownGateway(btn){
+  const hint = (SHUTDOWN_STATE && SHUTDOWN_STATE.restart_hint) || '启动脚本';
+  // 确认文案必须是**一行静态字符串**：i18n 包按整句逐字查表，拼 + 会让它永远命不中。
+  if(!confirm('确认关闭网关？停止后这个页面将无法连接，正在转发的请求可能被中断。这个操作无法在页面里撤销。')) return;
+  if(btn){ btn.disabled = true; btn.textContent = '正在关闭...'; }
+  try{
+    const r = await postJSON('/admin/shutdown', {confirm: true});
+    toast('网关已停止。请用启动脚本重新启动：' + ((r && r.restart_hint) || hint), 'ok');
+  }catch(e){
+    // 关闭时连接被掐断是预期结果（进程已经走了，浏览器拿不到响应）。
+    const msg = String((e && e.message) || e);
+    if(/Failed to fetch|NetworkError|load failed|Load failed/i.test(msg)){
+      toast('网关已停止。请用启动脚本重新启动：' + hint, 'ok');
+    } else {
+      toast('关闭失败: ' + msg, 'bad');
+    }
+  } finally{
+    if(btn){ btn.textContent = '关闭网关'; btn.disabled = false; }
+  }
+  // 进程退出后会一直 401/ECONNREFUSED：把面板轮询停掉，避免刷屏报错。
+  try{
+    (PANEL_TIMERS || []).forEach(t => clearInterval(t));
+    PANEL_TIMERS = [];
+  }catch(e){}
 }
 
 

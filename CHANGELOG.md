@@ -10,6 +10,28 @@
 - 主版本号只在确有破坏性变更时才动。
 - 本次正式版本 **1.9.10**：持续排队诊断、脱敏观测与提示纠正。
 
+## 未发布
+
+**✨ 新增：面板关闭网关（`POST /admin/shutdown`）**
+
+面板此前只能「一键更新（含自动重启）」，没有任何停止入口；要停只能去跑
+`stop-qoder-proxy.bat` / `.sh`。现在「设置 → 运行信息」下方新增**关闭网关**卡片。
+
+- 安全模型与一键更新一致：**面板会话 + 仅本机来源 + 请求体显式 `{"confirm": true}`**
+  （必须是布尔 true，`1` / `"true"` 一律 400，裸 POST 关不掉网关）；
+  `QD_SHUTDOWN_DISABLE=1` 一键禁用，`QD_SHUTDOWN_ALLOW_REMOTE=1` 才放开远程（不建议）。
+- **不在请求线程里调 `HTTPServer.shutdown()`** —— 那会等自己的 `serve_forever`
+  返回而死锁（#156 的形状）。改为先把响应发出去，再由独立线程延迟关闭，
+  收尾走与 SIGTERM 相同的路径（`server_close()` → atexit → pid 文件清理）。
+- 关停是幂等的：连点或并发只会关一次；当前进程没有监听器时返回 409，不谎报成功。
+- `GET /settings` 新增 `shutdown` 块（`can_shutdown` / `blocked_codes` /
+  `blocked_reasons` / `restart_hint`），面板据此**只在可执行时才渲染按钮**
+  （与 #132 的 `can_apply` 同一原则），并在关停后停掉自身轮询以免刷 401。
+- 文档：`docs/api.md` 补端点与闸门表，`docs/deployment.md` 补两个环境变量与
+  「容器里更推荐 `docker compose restart`」的说明；`i18n/en.json` 补文案（version 19→20）。
+- 测试：新增 `tests/_test_admin_shutdown.py`（42 条：三层闸门、confirm 类型、
+  禁用/远程开关、plan 可执行性与 code、真实关停后端口释放、幂等、源码接线与文档同步）。
+
 
 ## v1.9.10 — 持续排队诊断（#158）
 

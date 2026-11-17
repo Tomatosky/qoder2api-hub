@@ -2606,6 +2606,8 @@ def runtime_settings_view():
         "log_dir": LOG_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
         "version": VERSION,
+        # 面板「关闭网关」按钮的可执行性（不发请求、不改任何状态）
+        "shutdown": shutdown_plan_info(),
     }
 
 
@@ -3907,6 +3909,83 @@ def _is_loopback(host):
     host = str(host or "")
     return host in ("::1", "localhost") or host.startswith("127.") \
         or host.startswith("::ffff:127.")
+
+
+# ---------------------------------------------------------------------------
+# 面板关闭网关（POST /admin/shutdown）
+#
+# 与 /update/apply 同一套安全模型：面板会话 + 本机（QD_SHUTDOWN_ALLOW_REMOTE=1
+# 放开）+ QD_SHUTDOWN_DISABLE=1 一键禁用，并要求请求体显式 confirm，
+# 避免误点/脚本裸 POST 把网关关掉。
+#
+# 退出路径**不**在请求线程里调用 HTTPServer.shutdown()：那会在该线程等
+# serve_forever 退出，而 serve_forever 只会在自己的线程上返回 —— 这是
+# #156 记录过的死锁形状。改为：先回响应，再由单独的 daemon 线程延迟调用
+# shutdown()，让 serve_http_server 的 finally 正常走 server_close() 与
+# atexit（pid 文件清理），与 SIGTERM 的收尾路径一致。
+# ---------------------------------------------------------------------------
+SHUTDOWN_DISABLED = str(os.environ.get("QD_SHUTDOWN_DISABLE") or "").strip().lower() \
+    in ("1", "on", "true", "yes", "enable", "enabled")
+_ACTIVE_SERVER = None                  # main() 里绑定；plan 用它判断可执行性
+_SHUTDOWN_STARTED = False              # 一次进程只关一次（连点/并发去重）
+_SHUTDOWN_LOCK = threading.Lock()
+
+
+def _shutdown_allow_remote():
+    return str(os.environ.get("QD_SHUTDOWN_ALLOW_REMOTE") or "").strip().lower() \
+        in ("1", "on", "true", "yes", "enable", "enabled")
+
+
+def shutdown_plan_info():
+    """面板展示用的可执行性（不发请求、不关任何东西）。
+
+    阻断原因同时给 code 与中文 reasons：code 供前端映射成可翻译文案，
+    reasons 供 CLI / 直接读接口的调用方（不依赖面板 i18n）。
+    """
+    codes, reasons = [], []
+    if SHUTDOWN_DISABLED:
+        codes.append("disabled")
+        reasons.append("已禁用（QD_SHUTDOWN_DISABLE=1）")
+    if _ACTIVE_SERVER is None:
+        codes.append("no_listener")
+        reasons.append("当前进程未持有监听器（可能是测试或子进程）")
+    return {
+        "can_shutdown": not reasons,
+        "disabled": SHUTDOWN_DISABLED,
+        "allow_remote": _shutdown_allow_remote(),
+        "blocked_codes": codes,
+        "blocked_reasons": reasons,
+        "restart_hint": ("Windows: start-qoder-proxy.bat" if IS_WINDOWS
+                         else "Linux/macOS: ./start-qoder-proxy.sh"),
+    }
+
+
+def schedule_shutdown(delay=0.4):
+    """延迟关闭监听循环：先让响应的字节发出去，再优雅退出。
+
+    返回 False 表示当前没有可关闭的监听器（调用方应回 409）。
+    幂等：重复调用只会有一次关停（第二次起返回 False，避免连点起多个线程）。
+    """
+    global _SHUTDOWN_STARTED
+    with _SHUTDOWN_LOCK:
+        if _SHUTDOWN_STARTED:
+            return False
+        server = _ACTIVE_SERVER
+        if server is None:
+            return False
+        _SHUTDOWN_STARTED = True
+
+    def _run():
+        # shutdown() 阻塞到 serve_forever 返回；它在独立线程里调用才安全。
+        time.sleep(delay)
+        try:
+            server.shutdown()
+        except Exception as exc:      # pragma: no cover - 收尾失败也要退出
+            log("shutdown: server.shutdown() failed: %s" % exc, level="WARN",
+                tag="system")
+
+    threading.Thread(target=_run, name="qd-shutdown", daemon=True).start()
+    return True
 
 
 def update_plan_info():
@@ -12701,6 +12780,32 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_admin(self, path, payload):
         if not isinstance(payload, dict):
             return self._error(400, "expected a JSON object", "invalid_request_error")
+        if path == "/admin/shutdown":
+            # 关闭网关：面板会话（已在 do_POST 校验）+ 本机 + 显式 confirm。
+            # 与 /update/apply 同一套闸门；动作本身不可撤销，所以要求 confirm
+            # 为布尔 true，而不是任何真值（裸 POST 不能关掉网关）。
+            if SHUTDOWN_DISABLED:
+                return self._error(403, "shutdown is disabled "
+                                        "(QD_SHUTDOWN_DISABLE=1)",
+                                   "invalid_request_error")
+            if not _shutdown_allow_remote() and not _is_loopback(
+                    (self.client_address or ["?"])[0]):
+                return self._error(403, "shutdown is loopback-only "
+                                        "(set QD_SHUTDOWN_ALLOW_REMOTE=1 to allow)",
+                                   "invalid_request_error")
+            if payload.get("confirm") is not True:
+                return self._error(400, "confirm must be true "
+                                        "(body: {\"confirm\": true})",
+                                   "invalid_request_error")
+            if not schedule_shutdown():
+                return self._error(409, "no active listener in this process "
+                                        "(already shutting down?)",
+                                   "invalid_request_error")
+            log("panel: shutdown requested by %s - stopping after this response"
+                % ((self.client_address or ["?"])[0]), level="WARN", tag="system")
+            return self._json(200, {"ok": True, "stopping": True,
+                                    "restart_hint":
+                                        shutdown_plan_info()["restart_hint"]})
         if path == "/admin/routing/save":
             try:
                 config = qoder_routing.save_config(ACCOUNTS_DIR,
@@ -14742,7 +14847,7 @@ def _keepalive_send(entry):
 
 def main():
     global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, \
-        USAGE_SUMMARY, SCHEDULER
+        USAGE_SUMMARY, SCHEDULER, _ACTIVE_SERVER
     API_KEY_GENERATED = False
     ap = argparse.ArgumentParser(
         description="Qoder (qoder.com.cn / qoder.com) -> OpenAI-compatible proxy")
@@ -15097,6 +15202,10 @@ def main():
     log("listening  : http://%s:%d/v1  (api key: %s)"
         % (args.host, args.port, "on" if API_KEY else "off"))
     log("dashboard  : http://%s:%d/" % (args.host, args.port))
+    # 面板「关闭网关」只允许作用于本进程真正在服务的监听器：把它登记下来，
+    # schedule_shutdown() 才有对象可关（子进程/测试里会是 None）。
+    global _ACTIVE_SERVER
+    _ACTIVE_SERVER = server
 
     # 启动预热（后台线程，不阻塞监听）：拉一次动态模型清单并注册显示名，
     # 让「客户端跳过 /v1/models 直接发新模型名」的第一条请求也能解析对
