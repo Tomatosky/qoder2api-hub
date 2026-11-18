@@ -7673,6 +7673,13 @@ function keyCell(r){
   if(d.cls) return '<span class="' + d.cls + '" title="' + d.title + '">' + d.label + (d.sub ? ' ' + d.sub : '') + '</span>';
   return d.label + '<div class="mono" style="color:var(--dim);font-size:10px">' + d.sub + '</div>';
 }
+function usageModelCell(r){
+  const requested = r.requested_model || r.model || '—';
+  const known = typeof r.resolved_model === 'string' && r.resolved_model.trim();
+  if(!Object.prototype.hasOwnProperty.call(r, 'resolved_model')) return esc(requested);
+  return esc(requested) + (known && r.resolved_model === requested ? '' : ' → ' + (known ? esc(r.resolved_model) : '<span class="hint">?</span>'));
+}
+
 function effortCell(r){
   const mono = s => '<span class="mono" style="font-size:11px">' + esc(s) + '</span>';
   const hasReq = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort_requested');
@@ -7854,7 +7861,7 @@ async function refreshInner(){
     '<table><thead><tr><th>时间</th><th>模型</th><th>账号</th><th style="text-align:left">Key</th><th style="text-align:left">档位</th><th style="text-align:center;width:72px">区域</th><th>模式</th><th>耗时</th><th>首字</th><th>速度</th><th>输入</th><th>输出</th><th>思考</th><th>缓存</th><th>总 token</th><th style="text-align:right;width:84px">积分</th><th style="text-align:right;width:150px" title="按 token 折算的三段贡献：非缓存输入 + 缓存输入 + 输出；斜体「名义」表示上游标记为不计费">积分拆分</th></tr></thead><tbody>'
     + rows.map(r => '<tr>'
         + '<td class="mono">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
-        + '<td class="mono">' + esc(r.model)
+        + '<td class="mono">' + usageModelCell(r)
         + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)">' + esc((r.account||'—').slice(0,8)) + '</td>'
         + '<td style="text-align:left">' + keyCell(r) + '</td>'
