@@ -6,8 +6,8 @@
 为什么单独测这几条：
   1. **鉴权层次**：这是唯一能「让网关消失」的端点，面板会话 + 本机 + 显式
      confirm 三层必须是与逻辑与，任一层缺失都要拒绝；
-  2. **不死锁**：请求线程里直接调 HTTPServer.shutdown() 会等自己的
-     serve_forever 返回（#156 记录过的形状）。必须由另一个线程延迟关闭，
+  2. **不死锁**：serve_forever 同线程调用 shutdown() 会死锁（#156）；
+     ThreadingHTTPServer 的请求工作线程不同。此处独立线程延迟关闭，
      所以这里真的把服务关停并断言「响应先到、监听随后释放」；
   3. **不可误关**：`confirm` 必须是布尔 true（不是 1 / "true" / 任意真值），
      裸 POST 不能关掉网关；QD_SHUTDOWN_DISABLE=1 能一键禁用。
@@ -193,6 +193,7 @@ check("监听端口已释放", not accepts(port2, timeout=1))
 # 没有监听器时 schedule_shutdown 必须返回 False（不能凭空报成功）：
 # 直接测函数而不是再打一次已关闭的端口——Windows 上连已释放端口会挂到超时。
 P._ACTIVE_SERVER = None
+P._SHUTDOWN_STARTED = False
 check("无监听器时 schedule_shutdown 返回 False", P.schedule_shutdown() is False)
 _no_listener_plan = P.shutdown_plan_info()
 check("plan 在没有监听器时如实不可执行",
@@ -207,7 +208,7 @@ print("[3] 源码接线（main 必须登记监听器，前端必须留有入口�
 src = io.open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 check("main 把 server 登记为 _ACTIVE_SERVER",
       "global _ACTIVE_SERVER" in src and "_ACTIVE_SERVER = server" in src)
-check("关停走独立线程（请求线程内不得直接 shutdown）",
+check("关停走独立线程（避免阻塞请求响应）",
       "threading.Thread(target=_run, name=\"qd-shutdown\"" in src)
 check("延迟关闭在 shutdown 之前 sleep（先让响应发出去）",
       "time.sleep(delay)" in src and "server.shutdown()" in src)

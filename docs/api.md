@@ -170,10 +170,10 @@ curl -sS -X POST 'http://HOST/diag/queue' \
 | 闸门 | 行为 |
 |---|---|
 | 面板会话 | 缺少或无效的 `X-Panel-Token` → `401` |
-| 本机来源 | 非 loopback → `403`；设 `QD_SHUTDOWN_ALLOW_REMOTE=1` 放开（不建议） |
+| 本机来源 | 非 loopback 或携带 `Forwarded` / `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` → `403`；设 `QD_SHUTDOWN_ALLOW_REMOTE=1` 放开 |
 | 显式确认 | 请求体必须是 `{"confirm": true}`，**布尔 true**；`1` / `"true"` → `400` |
 | 一键禁用 | `QD_SHUTDOWN_DISABLE=1` → `403`，面板按钮同时隐藏 |
-| 无监听器 | 当前进程不持有监听器（子进程 / 测试）→ `409`，不谎报成功 |
+| 无监听器 / 正在关闭 | 返回 `409`；后台线程启动失败返回 `503`，可重试 |
 
 ```bash
 curl -X POST 'http://127.0.0.1:8790/admin/shutdown' \
@@ -182,8 +182,9 @@ curl -X POST 'http://127.0.0.1:8790/admin/shutdown' \
 # {"ok":true,"stopping":true,"restart_hint":"..."}
 ```
 
-响应**先返回**，再由独立线程延迟关闭监听循环（绝不在请求线程里调
-`HTTPServer.shutdown()`，那会等自己的 `serve_forever` 而死锁）。退出走与
+由独立线程延迟关闭监听循环，给响应发送留出时间。`HTTPServer.shutdown()`
+不能在运行 `serve_forever` 的同一线程调用；`ThreadingHTTPServer` 的请求工作线程
+与监听线程不同，并不天然死锁。退出走与
 SIGTERM 相同的收尾路径：`server_close()` → atexit（pid 文件清理）。
 `GET /settings` 的 `shutdown` 块回显 `can_shutdown` / `blocked_reasons` /
 `restart_hint`，面板据此决定是否渲染按钮。关闭后需用启动脚本重新拉起。

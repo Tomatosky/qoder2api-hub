@@ -3918,9 +3918,9 @@ def _is_loopback(host):
 # 放开）+ QD_SHUTDOWN_DISABLE=1 一键禁用，并要求请求体显式 confirm，
 # 避免误点/脚本裸 POST 把网关关掉。
 #
-# 退出路径**不**在请求线程里调用 HTTPServer.shutdown()：那会在该线程等
-# serve_forever 退出，而 serve_forever 只会在自己的线程上返回 —— 这是
-# #156 记录过的死锁形状。改为：先回响应，再由单独的 daemon 线程延迟调用
+# HTTPServer.shutdown() 不能在运行 serve_forever 的同一线程调用（#156）。
+# ThreadingHTTPServer 的请求工作线程并不是该线程，本身不会因此死锁。
+# 为避免阻塞响应，仍由单独的 daemon 线程延迟调用
 # shutdown()，让 serve_http_server 的 finally 正常走 server_close() 与
 # atexit（pid 文件清理），与 SIGTERM 的收尾路径一致。
 # ---------------------------------------------------------------------------
@@ -3946,6 +3946,9 @@ def shutdown_plan_info():
     if SHUTDOWN_DISABLED:
         codes.append("disabled")
         reasons.append("已禁用（QD_SHUTDOWN_DISABLE=1）")
+    if _SHUTDOWN_STARTED:
+        codes.append("stopping")
+        reasons.append("网关正在关闭")
     if _ACTIVE_SERVER is None:
         codes.append("no_listener")
         reasons.append("当前进程未持有监听器（可能是测试或子进程）")
@@ -3967,6 +3970,19 @@ def schedule_shutdown(delay=0.4):
     幂等：重复调用只会有一次关停（第二次起返回 False，避免连点起多个线程）。
     """
     global _SHUTDOWN_STARTED
+
+    def _run():
+        global _SHUTDOWN_STARTED
+        time.sleep(delay)
+        try:
+            server.shutdown()
+        except Exception as exc:
+            # The listener can still be serving: permit an explicit retry.
+            with _SHUTDOWN_LOCK:
+                _SHUTDOWN_STARTED = False
+            log("shutdown: server.shutdown() failed: %s" % exc, level="WARN",
+                tag="system")
+
     with _SHUTDOWN_LOCK:
         if _SHUTDOWN_STARTED:
             return False
@@ -3974,17 +3990,11 @@ def schedule_shutdown(delay=0.4):
         if server is None:
             return False
         _SHUTDOWN_STARTED = True
-
-    def _run():
-        # shutdown() 阻塞到 serve_forever 返回；它在独立线程里调用才安全。
-        time.sleep(delay)
         try:
-            server.shutdown()
-        except Exception as exc:      # pragma: no cover - 收尾失败也要退出
-            log("shutdown: server.shutdown() failed: %s" % exc, level="WARN",
-                tag="system")
-
-    threading.Thread(target=_run, name="qd-shutdown", daemon=True).start()
+            threading.Thread(target=_run, name="qd-shutdown", daemon=True).start()
+        except Exception:
+            _SHUTDOWN_STARTED = False
+            raise
     return True
 
 
@@ -12788,6 +12798,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(403, "shutdown is disabled "
                                         "(QD_SHUTDOWN_DISABLE=1)",
                                    "invalid_request_error")
+            # Local reverse proxies must not silently turn remote users into
+            # local operators. Ignore spoofed values; reject proxy provenance
+            # altogether unless remote shutdown was explicitly enabled.
+            proxy_headers = ("Forwarded", "X-Forwarded-For", "X-Real-IP",
+                             "CF-Connecting-IP")
+            if not _shutdown_allow_remote() and any(
+                    name in self.headers for name in proxy_headers):
+                return self._error(403, "shutdown rejects forwarded requests "
+                                        "(set QD_SHUTDOWN_ALLOW_REMOTE=1 to allow)",
+                                   "invalid_request_error")
             if not _shutdown_allow_remote() and not _is_loopback(
                     (self.client_address or ["?"])[0]):
                 return self._error(403, "shutdown is loopback-only "
@@ -12797,7 +12817,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "confirm must be true "
                                         "(body: {\"confirm\": true})",
                                    "invalid_request_error")
-            if not schedule_shutdown():
+            try:
+                scheduled = schedule_shutdown()
+            except Exception as exc:
+                log("shutdown: could not start worker: %s" % exc, level="WARN", tag="system")
+                return self._error(503, "could not start shutdown worker; retry",
+                                   "server_error")
+            if not scheduled:
                 return self._error(409, "no active listener in this process "
                                         "(already shutting down?)",
                                    "invalid_request_error")

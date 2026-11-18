@@ -210,7 +210,7 @@ Linux / macOS 先 `./stop-qoder-proxy.sh` 再 `./start-qoder-proxy.sh`（常驻/
 | 环境变量 | 默认 | 说明 |
 |---|---|---|
 | `QD_SHUTDOWN_DISABLE` | 关 | 设为 `1` 完全禁用关闭端点，面板按钮同时隐藏 |
-| `QD_SHUTDOWN_ALLOW_REMOTE` | 关 | 关闭端点默认**只允许本机**访问；设 `1` 才允许远程触发（面板会话仍然是必需的） |
+| `QD_SHUTDOWN_ALLOW_REMOTE` | 关 | 默认仅接受 loopback 直连，带 `Forwarded` / `X-Forwarded-For` / `X-Real-IP` / `CF-Connecting-IP` 的代理请求也拒绝；设 `1` 才放开（面板会话仍然必需） |
 
 关闭后必须用启动脚本重新拉起（Windows `start-qoder-proxy.bat` /
 Linux·macOS `./start-qoder-proxy.sh`）。正在转发的请求可能被中断，请避开高峰期操作。

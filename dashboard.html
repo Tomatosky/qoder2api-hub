@@ -4718,7 +4718,8 @@ async function adminGroupAction(action,btn){
 }
 function adminGroupResult(rows,status){const ok=rows.filter(x=>x.ok).length;status.textContent='已完成 '+ok+'/'+rows.length+' 成功'+(ok<rows.length?' · '+rows.filter(x=>!x.ok).map(x=>x.hint||x.error||'失败').join('；'):'');}
 async function adminWatchJob(id,status){
-  try{const r=await getJSON('/admin/jobs?id='+encodeURIComponent(id));const j=r.job||{};
+  if(!PANEL_READY) return;
+  try{const r=await getJSON('/admin/jobs?id='+encodeURIComponent(id));if(!PANEL_READY)return;const j=r.job||{};
     status.textContent='后台任务 '+(j.done||0)+' / '+(j.total||0);
     if(j.status==='completed'||j.status==='failed'){adminGroupResult(j.results||[],status);await loadAccounts();return;}
     if(!PANEL_READY)return;
@@ -6443,7 +6444,7 @@ async function triggerSchedulerNow(btn){
   try{
     const r = await postJSON("/scheduler/trigger", {});
     toast(r.msg || "已触发巡检保活", "ok");
-    setTimeout(loadSchedulerStatus, 2000);
+    setTimeout(() => { if(PANEL_READY) loadSchedulerStatus(); }, 2000);
   }catch(e){
     toast("触发失败: " + e.message, "bad");
   }finally{
@@ -8196,6 +8197,7 @@ function renderShutdownState(info){
   const REASONS = {
     disabled: '已禁用（QD_SHUTDOWN_DISABLE=1）',
     no_listener: '当前进程未持有监听器（可能是测试或子进程）',
+    stopping: '网关正在关闭',
   };
   const codes = (info.blocked_codes || []);
   const why = codes.length
@@ -8219,23 +8221,25 @@ async function shutdownGateway(btn){
   if(btn){ btn.disabled = true; btn.textContent = '正在关闭...'; }
   try{
     const r = await postJSON('/admin/shutdown', {confirm: true});
-    toast('网关已停止。请用启动脚本重新启动：' + ((r && r.restart_hint) || hint), 'ok');
+    if(!r || r.ok !== true || r.stopping !== true) throw new Error('未确认关停请求');
+    stopGatewayPolling();
+    toast('网关正在关闭。请用启动脚本重新启动：' + (r.restart_hint || hint), 'ok');
   }catch(e){
-    // 关闭时连接被掐断是预期结果（进程已经走了，浏览器拿不到响应）。
+    // A transport failure cannot prove the request reached the server.
     const msg = String((e && e.message) || e);
-    if(/Failed to fetch|NetworkError|load failed|Load failed/i.test(msg)){
-      toast('网关已停止。请用启动脚本重新启动：' + hint, 'ok');
-    } else {
-      toast('关闭失败: ' + msg, 'bad');
-    }
+    toast('关闭失败: ' + msg, 'bad');
   } finally{
     if(btn){ btn.textContent = '关闭网关'; btn.disabled = false; }
   }
-  // 进程退出后会一直 401/ECONNREFUSED：把面板轮询停掉，避免刷屏报错。
-  try{
-    (PANEL_TIMERS || []).forEach(t => clearInterval(t));
-    PANEL_TIMERS = [];
-  }catch(e){}
+}
+
+function stopGatewayPolling(){
+  PANEL_READY = false;
+  (PANEL_TIMERS || []).forEach(t => clearInterval(t));
+  PANEL_TIMERS = [];
+  stopLogPolling();
+  // Gate the independent overview interval and already queued callbacks too.
+  if(typeof RT_TIMER !== 'undefined') clearTimeout(RT_TIMER);
 }
 
 
@@ -9182,7 +9186,7 @@ const LOG_MAX_ROWS = 2000;   // 与 logEntries 的保留上限一致
 function startLogPolling(){
   if(logPollTimer) clearInterval(logPollTimer);
   logPollTimer = setInterval(() => {
-    if(logAutoRefresh && currentMainTab === 'logs'){
+    if(PANEL_READY && logAutoRefresh && currentMainTab === 'logs'){
       fetchNewLogs(false);
     }
   }, 2000);
