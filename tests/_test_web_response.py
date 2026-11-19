@@ -329,7 +329,7 @@ class HostedWebHandlerTests(unittest.TestCase):
 
     def test_upstream_error_after_sse_start_has_failed_terminal_only(self):
         _, events, _, _ = self.run_handler([], stream=True,
-            upstream_error=urllib.error.HTTPError("https://upstream", 401, "denied", {}, None))
+            upstream_error=urllib.error.HTTPError("https://upstream", 401, "denied", {}, io.BytesIO(b"")))
         self.assertEqual(events[0]["type"], "response.created")
         self.assertEqual(events[-1]["type"], "response.failed")
         self.assertNotIn("response.completed", [e["type"] for e in events])
@@ -377,10 +377,12 @@ class HostedWebHTTPTests(unittest.TestCase):
         cls.addClassCleanup(server.shutdown)
 
     def post(self, payload, deltas, finish, path="/v1/responses", *, done=True,
-             stream_factory=io.BytesIO, expected_status=200, upstream_model=None):
-        chunks = [{"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-                  for delta in deltas]
-        if finish is not None:
+             stream_factory=io.BytesIO, expected_status=200, upstream_model=None,
+             inner_chunks=None):
+        chunks = (copy.deepcopy(inner_chunks) if inner_chunks is not None else
+                  [{"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+                   for delta in deltas])
+        if inner_chunks is None and finish is not None:
             chunks.append({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
         if upstream_model is not None:
             chunks[0]["model"] = upstream_model
@@ -648,6 +650,53 @@ class HostedWebHTTPTests(unittest.TestCase):
                             ("response.completed", "response.failed", "response.incomplete")]
                 self.assertEqual([e["type"] for e in terminal], ["response." + expected])
                 self.assertEqual(terminal[0]["response"]["id"], events[0]["response"]["id"])
+
+    def test_hosted_inner_errors_fail_before_during_and_after_terminal(self):
+        payload = {"model": "test-model", "input": "Summarize", "tools": [{"type": "web_search"}],
+                   "metadata": {"tag": "preserved"}}
+        partial = {"choices": [{"index": 0, "delta": {"content": "Partial answer"}, "finish_reason": None}]}
+        stop = {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        marker = "PRIVATE_FAKE_ERROR_BODY"
+        error = {"error": {"code": "provider_error", "message": marker}}
+        error_stop = dict(error, **stop)
+        error_call = dict(error, choices=[{"index": 0, "delta": {"tool_calls": [
+            dict(call("web_search", {"query": "probe"}), index=0)]}, "finish_reason": "tool_calls"}])
+        cases = {"before": [error, partial, stop], "during": [partial, error_stop],
+                 "after": [partial, stop, error], "tool_call": [error_call],
+                 "string_error": [partial, {"error": marker}, stop]}
+        for name, chunks in cases.items():
+            for stream in (False, True):
+                with self.subTest(name=name, stream=stream), mock.patch.object(P, "log") as logs:
+                    # post asserts exactly one inference and zero tool executions.
+                    body, _ = self.post(dict(payload, stream=stream), [], None, inner_chunks=chunks,
+                                        expected_status=200 if stream else 502)
+                    self.assertNotIn(marker, body)
+                    self.assertNotIn(marker, str(logs.call_args_list))
+                    if stream:
+                        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+                        self.assertEqual([e["type"] for e in events],
+                                         ["response.created", "response.in_progress", "response.failed"])
+                        final = events[-1]["response"]
+                        self.assertEqual(final["id"], events[0]["response"]["id"])
+                        self.assertEqual(final["status"], "failed")
+                        self.assertEqual(final["metadata"], payload["metadata"])
+                        self.assertEqual(final["error"]["message"], "upstream stream failed")
+                    else:
+                        self.assertEqual(json.loads(body)["error"]["message"], "upstream stream failed")
+        # The same hosted orchestration is used by Chat Completions.
+        chat_payload = dict(payload, messages=[{"role": "user", "content": "Summarize"}])
+        for stream in (False, True):
+            self.post(dict(chat_payload, stream=stream), [], None, "/v1/chat/completions",
+                      inner_chunks=cases["during"], expected_status=502)
+
+    def test_unflagged_inner_error_observation_is_unchanged(self):
+        chunk = {"error": {"code": "fixture", "message": "ordinary-path-fixture"},
+                 "choices": [{"index": 0, "delta": {"content": "Text"}, "finish_reason": "stop"}]}
+        wire = ("data: " + json.dumps({"body": json.dumps(chunk)}) + "\n\n").encode()
+        with mock.patch.object(P, "log"):
+            result = P.aggregate_stream(io.BytesIO(wire), "test-model", holder={"usage": None})
+        self.assertEqual(result["choices"][0]["message"]["content"], "Text")
+        self.assertEqual(result["choices"][0]["finish_reason"], "stop")
 
     def test_upstream_socket_error_is_a_response_failure(self):
         class UpstreamReset(io.BytesIO):

@@ -9908,6 +9908,12 @@ def iter_inner_sse(resp, holder=None):
             continue
         if isinstance(inner, dict):
             _capture_model_identity(inner, holder, getattr(resp, "_qd_model_audit", None))
+            # Hosted orchestration must reject explicit errors even when a stop
+            # frame precedes/follows them. Do not log or expose raw error bodies,
+            # execute their tool calls, or replay an already established request.
+            if (holder is not None and holder.get("_hosted_web_fail_on_inner_error")
+                    and inner.get("error")):
+                raise UpstreamStatus(502, "upstream returned an error")
             # task-34：只观测（计数 + 首次告警），不影响下面的清洗/透传分支。
             note_inner_upstream_error(inner, status=status)
             note_queue_observation(scope, inner.get("error"))
@@ -14071,8 +14077,9 @@ class Handler(BaseHTTPRequestHandler):
             _round_t0 = time.time()
             try:
                 with resp:
-                    obj = aggregate_stream(resp, model, holder={"usage": None},
-                                           allowed_names=all_names, require_terminal=True)
+                    obj = aggregate_stream(resp, model, holder={
+                        "usage": None, "_hosted_web_fail_on_inner_error": True},
+                        allowed_names=all_names, require_terminal=True)
             except Exception:
                 # This block only consumes the upstream body. Socket errors
                 # here are source failures. Client write errors propagate.
