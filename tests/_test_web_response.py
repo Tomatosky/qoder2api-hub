@@ -382,6 +382,7 @@ class HostedWebHTTPTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"QD_WEB_TOOLS": "on", "QD_WEB_TOOLS_BACKEND": "qoder"}), \
                 mock.patch.object(P, "API_KEY", "web-http-key"), \
                 mock.patch.object(P, "open_upstream", return_value=upstream) as infer, \
+                mock.patch.object(P, "record_usage"), \
                 mock.patch.object(W, "run_tool") as run_tool:
             conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
             try:
@@ -429,6 +430,23 @@ class HostedWebHTTPTests(unittest.TestCase):
                 self.assertEqual(delta["item_id"], item["id"])
                 self.assertEqual(done["item_id"], item["id"])
 
+    def test_responses_stream_emits_the_first_argument_fragment_without_web_tools(self):
+        tools = [{"type": "function", "name": "lookup_order", "parameters": {"type": "object"}}]
+        payload = {"model": "test-model", "input": "Check my order", "tools": tools, "stream": True}
+        first, rest = '{"order":', '17}'
+        deltas = [{"tool_calls": [{"index": 0, "id": "call_order", "type": "function",
+                                   "function": {"name": "lookup_order", "arguments": first}}]},
+                  {"tool_calls": [{"index": 0, "function": {"arguments": rest}}]}]
+        body, _ = self.post(payload, deltas, "tool_calls")
+        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+        args = [e["delta"] for e in events if e["type"] == "response.function_call_arguments.delta"]
+        self.assertEqual(args, [first, rest])
+        done, = (e for e in events if e["type"] == "response.function_call_arguments.done")
+        item, = events[-1]["response"]["output"]
+        self.assertEqual(done["item_id"], item["id"])
+        self.assertEqual(done["arguments"], first + rest)
+        self.assertEqual(item["arguments"], done["arguments"])
+
     def test_chat_stream_preserves_tool_call_indices_and_finish_reason(self):
         functions = [{"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
                      for name in ("lookup_order", "lookup_store")]
@@ -448,31 +466,64 @@ class HostedWebHTTPTests(unittest.TestCase):
                           if c["function"].get("arguments")], [(0, "{}"), (1, "{}")])
         self.assertEqual(choices[-1]["finish_reason"], "tool_calls")
 
-    def test_responses_stream_preserves_namespaced_custom_tool_type(self):
-        tools = [{"type": "web_search"}, {"type": "namespace", "name": "orders",
-                 "tools": [{"type": "custom", "name": "order_query"}]}]
-        payload = {"model": "test-model", "input": "Check my order", "tools": tools, "stream": True}
-        function = {"name": "order_query", "arguments": '{"input":"STATUS 17"}'}
-        delta = {"tool_calls": [{"index": 0, "id": "call_query", "type": "function", "function": function}]}
-        body, _ = self.post(payload, [delta], "tool_calls")
+    def test_responses_stream_preserves_namespaced_custom_tool_and_unwrapped_input(self):
+        tool = {"type": "namespace", "name": "orders",
+                "tools": [{"type": "custom", "name": "order_query"}]}
+        raw_input = 'STATUS "17"\n查订单'
+        arguments = json.dumps({"input": raw_input})
+        first, rest = arguments[:10], arguments[10:]
+        deltas = [{"tool_calls": [{"index": 0, "id": "call_query", "type": "function",
+                                   "function": {"name": "order_query", "arguments": first}}]},
+                  {"tool_calls": [{"index": 0, "function": {"arguments": rest}}]}]
+        for hosted in (False, True):
+            with self.subTest(hosted=hosted):
+                declarations = [{"type": "web_search"}, tool] if hosted else [tool]
+                payload = {"model": "test-model", "stream": True, "input": [
+                    {"role": "user", "content": "Check my order"},
+                    {"type": "additional_tools", "tools": declarations},
+                ]}
+                body, _ = self.post(payload, deltas, "tool_calls")
+                events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+                item, = events[-1]["response"]["output"]
+                self.assertEqual((item["type"], item["namespace"], item["input"]),
+                                 ("custom_tool_call", "orders", raw_input))
+                self.assertFalse(any(e["type"].startswith("response.function_call_arguments.") for e in events))
+                delta, done = [e for e in events if e["type"].startswith("response.custom_tool_call_input.")]
+                self.assertEqual(delta["delta"], raw_input)
+                self.assertEqual(done["input"], raw_input)
+                self.assertEqual(delta["item_id"], item["id"])
+                self.assertEqual(done["item_id"], item["id"])
+
+    def test_responses_stream_replays_final_reasoning_summary_with_hosted_tools(self):
+        payload = {"model": "test-model", "input": "Summarize", "tools": [{"type": "web_search"}],
+                   "stream": True}
+        deltas = [{"reasoning_content": "Summary"}, {"content": "Answer"}]
+        body, _ = self.post(payload, deltas, "stop")
         events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
-        item, = events[-1]["response"]["output"]
-        self.assertEqual((item["type"], item["namespace"], item["input"]),
-                         ("custom_tool_call", "orders", "STATUS 17"))
+        result = events[-1]["response"]
+        self.assertEqual([item["type"] for item in result["output"]], ["reasoning", "message"])
+        reasoning, message = result["output"]
+        self.assertEqual(reasoning["summary"], [{"type": "summary_text", "text": "Summary"}])
+        self.assertEqual(message["content"][0]["text"], "Answer")
+        done, = (e for e in events if e["type"] == "response.reasoning_summary_text.done")
+        self.assertEqual(done["item_id"], reasoning["id"])
 
     def test_responses_length_has_the_same_status_in_both_modes(self):
-        payload = {"model": "test-model", "input": "Summarize", "tools": [{"type": "web_search"}]}
         deltas = [{"content": "Partial answer"}]
-        body, _ = self.post(payload, deltas, "length")
-        aggregated = json.loads(body)
-        stream, _ = self.post(dict(payload, stream=True), deltas, "length")
-        events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
-        self.assertEqual([e["type"] for e in events if e["type"] in
-                          ("response.completed", "response.incomplete")], ["response.incomplete"])
-        for result in (aggregated, events[-1]["response"]):
-            self.assertEqual(result["status"], "incomplete")
-            self.assertEqual(result["incomplete_details"], {"reason": "max_output_tokens"})
-            self.assertEqual(result["output_text"], "Partial answer")
+        for tools in ([], [{"type": "web_search"}]):
+            with self.subTest(tools=tools):
+                payload = {"model": "test-model", "input": "Summarize", "tools": tools}
+                body, _ = self.post(payload, deltas, "length")
+                aggregated = json.loads(body)
+                stream, _ = self.post(dict(payload, stream=True), deltas, "length")
+                events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
+                self.assertEqual(events[-1]["type"], "response.incomplete")
+                self.assertNotIn("response.completed", [event["type"] for event in events])
+                for result in (aggregated, events[-1]["response"]):
+                    self.assertEqual(result["status"], "incomplete")
+                    self.assertEqual(result["incomplete_details"], {"reason": "max_output_tokens"})
+                    self.assertEqual(result["output_text"], "Partial answer")
+                    self.assertEqual(result["output"][0]["status"], "incomplete")
 
 
 if __name__ == "__main__":

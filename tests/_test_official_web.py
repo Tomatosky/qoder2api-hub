@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+import urllib.request
 from types import SimpleNamespace
 from unittest import mock
 
@@ -23,6 +24,7 @@ import qoder_official_web as O
 import qoder_proxy as P
 import qoder_webtools as W
 from qoder_sign import qoder_decode
+from qoder_web_response import WebEvidence
 
 
 def account(uid="test-one", realm="cn", vpc=False, gateway=None):
@@ -82,9 +84,39 @@ class OfficialWebTests(unittest.TestCase):
 
     def test_signed_transport_installs_no_redirect_policy(self):
         opener = A._opener_for_request(follow_redirects=False)
-        handlers = opener.handle_error["http"][302]
+        handlers = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
         self.assertEqual(len(handlers), 1)
-        self.assertIsNone(handlers[0].redirect_request(None, None, 302, "", {}, ""))
+        self.assertIsInstance(handlers[0], A._NoRedirectHandler)
+        self.transport.stop()
+        response = io.BytesIO(json.dumps(page_items()).encode("utf-8"))
+        with mock.patch.object(A, "_opener_for_request", return_value=opener) as build, \
+                mock.patch.object(opener, "open", return_value=response), \
+                mock.patch.object(A, "validate_public_http_url"):
+            self.assertTrue(O.search(self.acc, "test")["ok"])
+        build.assert_called_once_with(follow_redirects=False)
+
+    def test_request_cache_separates_official_origins_and_account_identity(self):
+        evidence = WebEvidence()
+        config = {"backend": "qoder"}
+
+        def lookup(acc):
+            results = []
+            W.run_tool("web_search", {"query": "docs"}, account=acc, context=evidence,
+                       on_result=results.append, config=config)
+            self.assertTrue(results[0]["ok"])
+
+        other_realm = account(self.acc.uid, realm="intl")
+        other_realm.access_token = self.acc.access_token
+        other_origin = account(self.acc.uid, gateway="https://other.example")
+        for count, acc in enumerate((self.acc, other_realm, other_origin), start=1):
+            lookup(acc)
+            lookup(acc)
+            self.assertEqual(self.http.call_count, count)
+        other_origin.access_token = "refreshed-test-token"
+        lookup(other_origin)
+        lookup(other_origin)
+        self.assertEqual(self.http.call_count, 4)
+        self.assertNotIn(other_origin.access_token, repr(evidence.cache))
 
     def test_missing_other_realm_and_vpc_rejected_without_network(self):
         for acc in [None, account(realm="unknown"), account(vpc=True),

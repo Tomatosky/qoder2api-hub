@@ -289,8 +289,6 @@ class ResponsesWebOutput:
                         part["annotations"] = self.evidence.annotations(part.get("text") or "")
             if "response" in data:
                 data["response"] = self.enhance(data["response"])
-                if kind == "response.completed" and data["response"].get("status") == "incomplete":
-                    kind = "response.incomplete"
             self.emit(kind, **data)
         self.ended = True
 

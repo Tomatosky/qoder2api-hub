@@ -9005,16 +9005,12 @@ def _chat_chunks(obj, model):
         return dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": finish_reason}])
 
     yield chunk({"role": "assistant"})
-    text = message.get("content")
-    if text:
-        yield chunk({"content": text})
-    for index, call in enumerate(message.get("tool_calls") or []):
-        function = call["function"]
-        yield chunk({"tool_calls": [{"index": index, "id": call["id"], "type": call["type"],
-                                     "function": {"name": function["name"], "arguments": ""}}]})
-        if function.get("arguments"):
-            yield chunk({"tool_calls": [{"index": index, "function": {
-                "arguments": function["arguments"]}}]})
+    for field in ("reasoning_content", "content"):
+        if message.get(field):
+            yield chunk({field: message[field]})
+    calls = message.get("tool_calls") or []
+    if calls:
+        yield chunk({"tool_calls": [dict(call, index=index) for index, call in enumerate(calls)]})
     tail = chunk({}, choice.get("finish_reason") or "stop")
     if obj.get("usage"):
         tail["usage"] = obj["usage"]
@@ -9022,8 +9018,8 @@ def _chat_chunks(obj, model):
 
 
 def _chat_chunks_iter(obj, model):
-    return [("data: " + json.dumps(c, ensure_ascii=False) + "\n\n").encode()
-            for c in _chat_chunks(obj, model)]
+    for chunk in _chat_chunks(obj, model):
+        yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
 def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
@@ -10204,6 +10200,10 @@ def _additional_tools_from_input(inp):
     return out
 
 
+def _responses_tool_declarations(payload):
+    return list(payload.get("tools") or []) + _additional_tools_from_input(payload.get("input"))
+
+
 def _stamp_tool_namespace(item, ns_map):
     """回程：把 namespace 补到 function_call/custom_tool_call 项上（issue #127）。"""
     if not isinstance(item, dict) or not ns_map:
@@ -10340,6 +10340,8 @@ def responses_to_chat(payload, hosted_web=False):
             if not isinstance(item, dict):
                 continue
             itype = item.get("type")
+            if itype in ("additional_tools", "mcp_tools"):
+                continue  # These declarations are collected separately from conversation items.
             if itype in (None, "message"):
                 body = _flatten_content(item.get("content"))
                 if body:
@@ -10493,8 +10495,7 @@ def responses_to_chat(payload, hosted_web=False):
         chat["reasoning_effort"] = effort
     # issue #127：工具清单可能分两处（顶层 tools + input 里的 additional_tools），
     # 且可能包在 type:"namespace" 容器里。先合并再展平，最后才做类型过滤。
-    _raw_tools = list(payload.get("tools") or [])
-    _raw_tools.extend(_additional_tools_from_input(payload.get("input")))
+    _raw_tools = _responses_tool_declarations(payload)
     if _raw_tools:
         _flat_tools, _ns_map = _flatten_ns_tools(_raw_tools)
         if hosted_web:
@@ -10549,6 +10550,7 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
     msg = choice.get("message") or {}
     text = msg.get("content") or ""
     reasoning = msg.get("reasoning_content") or ""
+    status = "incomplete" if choice.get("finish_reason") == "length" else "completed"
     output = []
     if reasoning:
         output.append({
@@ -10613,17 +10615,16 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
         output.append({
             "id": _new_id("msg_"),
             "type": "message",
-            "status": "completed",
+            "status": status,
             "role": "assistant",
             "content": [{"type": "output_text", "text": text,
                          "annotations": []}] if text else [],
         })
-    finish = choice.get("finish_reason") or "stop"
     obj = {
         "id": _new_id("resp_"),
         "object": "response",
         "created_at": int(time.time()),
-        "status": "completed" if finish != "length" else "incomplete",
+        "status": status,
         "model": model,
         "output": output,
         "output_text": text,
@@ -10635,7 +10636,7 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
     u = _responses_usage(chat_obj.get("usage"))
     if u:
         obj["usage"] = u
-    if finish == "length":
+    if status == "incomplete":
         obj["incomplete_details"] = {"reason": "max_output_tokens"}
     return obj
 
@@ -10758,7 +10759,7 @@ def stream_responses_events(inner_lines, model, holder):
                         "output_index": out_idx,
                         "id": c_id,
                         "name": fn_name,
-                        "arguments": fn_args,
+                        "arguments": "",
                         "custom": is_custom,
                         "item_id": _new_id("ctc_" if is_custom else "fc_"),
                     }
@@ -10782,22 +10783,15 @@ def stream_responses_events(inner_lines, model, holder):
                         entry["name"] = fn_name
                         if fn_name in custom_names:
                             entry["custom"] = True
-                    if fn_args:
-                        entry["arguments"] += fn_args
-                        if entry.get("custom"):
-                            yield ev("response.custom_tool_call_input.delta", {
-                                "output_index": entry["output_index"],
-                                "item_id": entry["item_id"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
-                        else:
-                            yield ev("response.function_call_arguments.delta", {
-                                "output_index": entry["output_index"],
-                                "item_id": entry["item_id"],
-                                "call_id": entry["id"],
-                                "delta": fn_args,
-                            })
+                if fn_args:
+                    entry["arguments"] += fn_args
+                    if not entry["custom"]:
+                        yield ev("response.function_call_arguments.delta", {
+                            "output_index": entry["output_index"],
+                            "item_id": entry["item_id"],
+                            "call_id": entry["id"],
+                            "delta": fn_args,
+                        })
             piece = delta.get("content")
             if piece:
                 if msg_index is None:
@@ -10924,11 +10918,21 @@ def stream_responses_events(inner_lines, model, holder):
     for idx in sorted(tool_calls_map.keys()):
         entry = tool_calls_map[idx]
         if entry.get("custom"):
+            # The upstream function wraps freeform input in JSON. Decode the
+            # complete string once so deltas and the final item agree.
+            custom_input = _unwrap_custom_input(entry["arguments"])
+            if custom_input:
+                yield ev("response.custom_tool_call_input.delta", {
+                    "output_index": entry["output_index"],
+                    "item_id": entry["item_id"],
+                    "call_id": entry["id"],
+                    "delta": custom_input,
+                })
             yield ev("response.custom_tool_call_input.done", {
                 "output_index": entry["output_index"],
                 "item_id": entry["item_id"],
                 "call_id": entry["id"],
-                "input": _unwrap_custom_input(entry["arguments"]),
+                "input": custom_input,
             })
             fc_item = _stamp_tool_namespace({
                 "id": entry["item_id"],
@@ -10936,7 +10940,7 @@ def stream_responses_events(inner_lines, model, holder):
                 "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
-                "input": _unwrap_custom_input(entry["arguments"]),
+                "input": custom_input,
             }, (holder or {}).get("tool_ns"))
         else:
             yield ev("response.function_call_arguments.done", {
@@ -11075,6 +11079,7 @@ def stream_responses_events(inner_lines, model, holder):
             })
             yield ev("response.output_item.done",
                      {"output_index": out_idx, "item": fc_item})
+    status = "incomplete" if finish == "length" else "completed"
     # 3. 有文本或没有任何输出项时，补 message 项
     has_other_items = any(o for o in outputs if o)
     if msg_index is not None or full_text or not has_other_items:
@@ -11103,14 +11108,13 @@ def stream_responses_events(inner_lines, model, holder):
             "part": {"type": "output_text", "text": full_text,
                      "annotations": []},
         })
-        outputs[msg_index] = msg_item("completed")
+        outputs[msg_index] = msg_item(status)
         yield ev("response.output_item.done",
                  {"output_index": msg_index, "item": outputs[msg_index]})
-    status = "completed" if finish != "length" else "incomplete"
     final = resp_obj(status)
-    if finish == "length":
+    if status == "incomplete":
         final["incomplete_details"] = {"reason": "max_output_tokens"}
-    yield ev("response.completed", {"response": final})
+    yield ev("response." + status, {"response": final})
 
 
 def _responses_completed_quiet(holder, model=""):
@@ -13706,10 +13710,10 @@ class Handler(BaseHTTPRequestHandler):
         if is_responses and qoder_webtools.WEB_SEARCH_NAME in names:
             names.add(qoder_webtools.WEB_FETCH_NAME)
         try:
-            declared_tools = list(payload.get("tools") or [])
             if is_responses:
-                declared_tools.extend(_additional_tools_from_input(payload.get("input")))
-                declared_tools, _ = _flatten_ns_tools(declared_tools)
+                declared_tools, _ = _flatten_ns_tools(_responses_tool_declarations(payload))
+            else:
+                declared_tools = list(payload.get("tools") or [])
             evidence = qoder_web_response.WebEvidence(declared_tools)
             web_config = qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True)
             call_limit = payload.get("max_tool_calls", 8)
@@ -13893,17 +13897,16 @@ class Handler(BaseHTTPRequestHandler):
         if not want_stream:
             return self._json(200, obj)
         self._sse_begin()
-        for chunk in _chat_chunks(obj, model):
-            self._sse_write(("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8"))
+        for frame in _chat_chunks_iter(obj, model):
+            self._sse_write(frame)
         self._sse_write(b"data: [DONE]\n\n")
 
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
+        # issue #127：在转换成 chat 请求前保留原始 custom 类型。
+        custom_names = custom_tool_names(_responses_tool_declarations(payload))
         chat_req = responses_to_chat(payload)
-        # issue #127：custom 判型必须用**合并 + 展平后**的清单（顶层 tools 与
-        # input.additional_tools 都可能含容器），否则回程判型与出站不一致。
-        custom_names = custom_tool_names(chat_req.get("tools") or [])
         tool_ns = chat_req.get("_qd_tool_ns") or {}
         self._apply_context_header(chat_req)  # issue #106
         model = payload.get("model") or "auto"
