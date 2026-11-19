@@ -217,11 +217,16 @@ class HostedWebHandlerTests(unittest.TestCase):
         u2 = {"prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23,
               "prompt_tokens_details": {"cached_tokens": 5},
               "completion_tokens_details": {"reasoning_tokens": 2}}
-        (status, obj), _, requests, _ = self.run_handler(
-            [reply(calls=[call()], usage=u1), reply("Summary [S1]", usage=u2)], rounds=1)
+        first = dict(reply(calls=[call()], usage=u1), resolved_model="search-model")
+        first["choices"][0]["message"]["reasoning_content"] = "Tool-round reasoning"
+        final = dict(reply("Summary [S1]", usage=u2), resolved_model="synthesis-model")
+        (status, obj), _, requests, _ = self.run_handler([first, final], rounds=1)
+        self.assertEqual(status, 200)
+        self.assertEqual(obj["resolved_model"], "synthesis-model")
         self.assertEqual(len(requests), 2)
         self.assertEqual(requests[1]["tools"], [])
         self.assertEqual(requests[1]["tool_choice"], "none")
+        self.assertEqual(requests[1]["messages"][-2]["reasoning_content"], "Tool-round reasoning")
         self.assertIn("Published: 2026-11-16", requests[1]["messages"][-1]["content"])
         self.assertEqual(obj["usage"]["input_tokens"], 30)
         self.assertEqual(obj["usage"]["output_tokens"], 5)
@@ -372,11 +377,13 @@ class HostedWebHTTPTests(unittest.TestCase):
         cls.addClassCleanup(server.shutdown)
 
     def post(self, payload, deltas, finish, path="/v1/responses", *, done=True,
-             stream_factory=io.BytesIO, expected_status=200):
+             stream_factory=io.BytesIO, expected_status=200, upstream_model=None):
         chunks = [{"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
                   for delta in deltas]
         if finish is not None:
             chunks.append({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+        if upstream_model is not None:
+            chunks[0]["model"] = upstream_model
         envelopes = [{"body": json.dumps(chunk)} for chunk in chunks]
         if done:
             envelopes.append({"body": "[DONE]"})
@@ -533,40 +540,97 @@ class HostedWebHTTPTests(unittest.TestCase):
         done, = (e for e in events if e["type"] == "response.reasoning_summary_text.done")
         self.assertEqual(done["item_id"], reasoning["id"])
 
-    def test_responses_length_has_the_same_status_in_both_modes(self):
+    def test_hosted_responses_echo_the_effective_parallel_setting(self):
+        hosted_tool = {"type": "web_search"}
+        client_tool = {"type": "function", "name": "get_time", "parameters": {"type": "object"}}
+        cases = [
+            ([hosted_tool], {}, True),
+            ([hosted_tool, client_tool], {}, False),
+            ([hosted_tool, client_tool], {"parallel_tool_calls": False}, False),
+            ([hosted_tool, client_tool], {"parallel_tool_calls": True}, True),
+        ]
+        for tools, options, expected in cases:
+            with self.subTest(tools=len(tools), options=options):
+                payload = dict(options, model="test-model", input="Say hi", tools=tools)
+                deltas = [{"content": "Hello"}]
+                body, request = self.post(payload, deltas, "stop")
+                self.assertIs(request["parallel_tool_calls"], expected)
+                self.assertIs(json.loads(body)["parallel_tool_calls"], expected)
+                stream, request = self.post(dict(payload, stream=True), deltas, "stop")
+                self.assertIs(request["parallel_tool_calls"], expected)
+                events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
+                responses = [event["response"] for event in events if "response" in event]
+                self.assertGreaterEqual(len(responses), 3)
+                for response in responses:
+                    self.assertIs(response["parallel_tool_calls"], expected)
+
+    def test_hosted_responses_distinguish_requested_and_reported_models(self):
+        alias = "test-model"
+        payload = {"model": alias, "input": "Say hi", "tools": [{"type": "web_search"}]}
+        deltas = [{"content": "Hello"}]
+        for actual in (None, "reported-model"):
+            with self.subTest(actual=actual):
+                body, _ = self.post(payload, deltas, "stop", upstream_model=actual)
+                stream, _ = self.post(dict(payload, stream=True), deltas, "stop", upstream_model=actual)
+                events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
+                lifecycle = [event for event in events if "response" in event]
+                self.assertEqual([event["type"] for event in lifecycle[:2]],
+                                 ["response.created", "response.in_progress"])
+                for event in lifecycle[:2]:
+                    self.assertEqual(event["response"]["model"], "")
+                    self.assertIsNone(event["response"]["resolved_model"])
+                self.assertEqual(len(lifecycle), 4 if actual else 3)
+                if actual:
+                    self.assertEqual(lifecycle[2]["type"], "response.in_progress")
+                    self.assertEqual(lifecycle[2]["response"]["model"], actual)
+                self.assertEqual(lifecycle[-1]["type"], "response.completed")
+                self.assertTrue(all(event["response"]["requested_model"] == alias for event in lifecycle))
+                self.assertEqual({event["response"]["id"] for event in lifecycle},
+                                 {lifecycle[0]["response"]["id"]})
+                for response in (json.loads(body), events[-1]["response"]):
+                    self.assertEqual(response["model"], actual or "")
+                    self.assertEqual(response["resolved_model"], actual)
+                    self.assertEqual(response["requested_model"], alias)
+
+    def test_responses_incomplete_has_the_same_status_in_both_modes(self):
         deltas = [{"content": "Partial answer"}]
         for tools in ([], [{"type": "web_search"}]):
-            with self.subTest(tools=tools):
-                payload = {"model": "test-model", "input": "Summarize", "tools": tools}
-                body, _ = self.post(payload, deltas, "length")
-                aggregated = json.loads(body)
-                stream, _ = self.post(dict(payload, stream=True), deltas, "length")
-                events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
-                self.assertEqual(events[-1]["type"], "response.incomplete")
-                self.assertNotIn("response.completed", [event["type"] for event in events])
-                for result in (aggregated, events[-1]["response"]):
-                    self.assertEqual(result["status"], "incomplete")
-                    self.assertEqual(result["incomplete_details"], {"reason": "max_output_tokens"})
-                    self.assertEqual(result["output_text"], "Partial answer")
-                    self.assertEqual(result["output"][0]["status"], "incomplete")
+            for finish, reason in (("length", "max_output_tokens"), ("content_filter", "content_filter")):
+                with self.subTest(tools=tools, finish=finish):
+                    payload = {"model": "test-model", "input": "Summarize", "tools": tools}
+                    body, _ = self.post(payload, deltas, finish)
+                    aggregated = json.loads(body)
+                    stream, _ = self.post(dict(payload, stream=True), deltas, finish)
+                    events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
+                    self.assertEqual(events[-1]["type"], "response.incomplete")
+                    self.assertNotIn("response.completed", [event["type"] for event in events])
+                    for result in (aggregated, events[-1]["response"]):
+                        self.assertEqual(result["status"], "incomplete")
+                        self.assertEqual(result["incomplete_details"], {"reason": reason})
+                        self.assertEqual(result["output_text"], "Partial answer")
+                        self.assertEqual(result["output"][0]["status"], "incomplete")
 
-    def test_hosted_calls_at_output_limit_are_not_dispatched(self):
+    def test_hosted_calls_in_incomplete_round_are_not_dispatched(self):
         tools = [{"type": "web_search"},
                  {"type": "function", "name": "get_time", "parameters": {"type": "object"}}]
         payload = {"model": "test-model", "input": "Tell me the time", "tools": tools}
         hosted_call = dict(call("web_search", {"query": "time"}, id="call_search"), index=0)
         client_call = dict(call("get_time", {"zone": "UTC"}, id="call_time"), index=1)
-        for calls in ([hosted_call], [hosted_call, client_call]):
-            with self.subTest(calls=len(calls)):
+        cases = [
+            ("length", [hosted_call], "max_output_tokens", []),
+            ("length", [hosted_call, client_call], "max_output_tokens", ["call_time"]),
+            ("content_filter", [hosted_call, client_call], "content_filter", []),
+        ]
+        for finish, calls, reason, expected_call_ids in cases:
+            with self.subTest(finish=finish, calls=len(calls)):
                 deltas = [{"content": "Partial answer", "tool_calls": calls}]
-                expected_call_ids = ["call_time"] if len(calls) == 2 else []
-                body, _ = self.post(payload, deltas, "length")
-                stream, _ = self.post(dict(payload, stream=True), deltas, "length")
+                body, _ = self.post(payload, deltas, finish)
+                stream, _ = self.post(dict(payload, stream=True), deltas, finish)
                 events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
                 self.assertEqual(events[-1]["type"], "response.incomplete")
                 for result in (json.loads(body), events[-1]["response"]):
                     self.assertEqual(result["status"], "incomplete")
-                    self.assertEqual(result["incomplete_details"], {"reason": "max_output_tokens"})
+                    self.assertEqual(result["incomplete_details"], {"reason": reason})
                     self.assertEqual(result["output_text"], "Partial answer")
                     self.assertEqual([item["call_id"] for item in result["output"]
                                       if item["type"] == "function_call"], expected_call_ids)
