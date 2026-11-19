@@ -371,14 +371,18 @@ class HostedWebHTTPTests(unittest.TestCase):
         cls.addClassCleanup(thread.join)
         cls.addClassCleanup(server.shutdown)
 
-    def post(self, payload, deltas, finish, path="/v1/responses"):
+    def post(self, payload, deltas, finish, path="/v1/responses", *, done=True,
+             stream_factory=io.BytesIO, expected_status=200):
         chunks = [{"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
                   for delta in deltas]
-        chunks.append({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
-        envelopes = [{"body": json.dumps(chunk)} for chunk in chunks] + [{"body": "[DONE]"}]
+        if finish is not None:
+            chunks.append({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]})
+        envelopes = [{"body": json.dumps(chunk)} for chunk in chunks]
+        if done:
+            envelopes.append({"body": "[DONE]"})
         wire = "".join("data: " + json.dumps(envelope) + "\n\n" for envelope in envelopes)
         account = SimpleNamespace(uid="test-http", realm="cn")
-        upstream = (io.BytesIO(wire.encode("utf-8")), account, None)
+        upstream = (stream_factory(wire.encode("utf-8")), account, None)
         with mock.patch.dict(os.environ, {"QD_WEB_TOOLS": "on", "QD_WEB_TOOLS_BACKEND": "qoder"}), \
                 mock.patch.object(P, "API_KEY", "web-http-key"), \
                 mock.patch.object(P, "open_upstream", return_value=upstream) as infer, \
@@ -389,7 +393,7 @@ class HostedWebHTTPTests(unittest.TestCase):
                 conn.request("POST", path, body=json.dumps(payload), headers={
                     "Content-Type": "application/json", "Authorization": "Bearer web-http-key"})
                 with conn.getresponse() as resp:
-                    self.assertEqual(resp.status, 200)
+                    self.assertEqual(resp.status, expected_status)
                     body = resp.read().decode("utf-8")
             finally:
                 conn.close()
@@ -446,6 +450,27 @@ class HostedWebHTTPTests(unittest.TestCase):
         self.assertEqual(done["item_id"], item["id"])
         self.assertEqual(done["arguments"], first + rest)
         self.assertEqual(item["arguments"], done["arguments"])
+
+    def test_responses_empty_function_arguments_are_valid_json_in_both_modes(self):
+        tools = [{"type": "web_search"},
+                 {"type": "function", "name": "get_time", "parameters": {"type": "object"}}]
+        payload = {"model": "test-model", "input": "Tell me the time", "tools": tools}
+        for value in ("", " \t"):
+            with self.subTest(value=value):
+                deltas = [{"tool_calls": [{"index": 0, "id": "call_time", "type": "function",
+                    "function": {"name": "get_time", "arguments": value}}]}]
+                body, _ = self.post(payload, deltas, "tool_calls")
+                item, = json.loads(body)["output"]
+                self.assertEqual(item["arguments"], "{}")
+                stream, _ = self.post(dict(payload, stream=True), deltas, "tool_calls")
+                events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
+                delta, done = [e for e in events if e["type"].startswith("response.function_call_arguments.")]
+                streamed, = events[-1]["response"]["output"]
+                self.assertEqual(delta["type"], "response.function_call_arguments.delta")
+                self.assertEqual(done["type"], "response.function_call_arguments.done")
+                self.assertEqual(delta["delta"], item["arguments"])
+                self.assertEqual(done["arguments"], item["arguments"])
+                self.assertEqual(streamed["arguments"], item["arguments"])
 
     def test_chat_stream_preserves_tool_call_indices_and_finish_reason(self):
         functions = [{"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
@@ -524,6 +549,59 @@ class HostedWebHTTPTests(unittest.TestCase):
                     self.assertEqual(result["incomplete_details"], {"reason": "max_output_tokens"})
                     self.assertEqual(result["output_text"], "Partial answer")
                     self.assertEqual(result["output"][0]["status"], "incomplete")
+
+    def test_hosted_calls_at_output_limit_are_not_dispatched(self):
+        tools = [{"type": "web_search"},
+                 {"type": "function", "name": "get_time", "parameters": {"type": "object"}}]
+        payload = {"model": "test-model", "input": "Tell me the time", "tools": tools}
+        hosted_call = dict(call("web_search", {"query": "time"}, id="call_search"), index=0)
+        client_call = dict(call("get_time", {"zone": "UTC"}, id="call_time"), index=1)
+        for calls in ([hosted_call], [hosted_call, client_call]):
+            with self.subTest(calls=len(calls)):
+                deltas = [{"content": "Partial answer", "tool_calls": calls}]
+                expected_call_ids = ["call_time"] if len(calls) == 2 else []
+                body, _ = self.post(payload, deltas, "length")
+                stream, _ = self.post(dict(payload, stream=True), deltas, "length")
+                events = [json.loads(line[6:]) for line in stream.splitlines() if line.startswith("data: ")]
+                self.assertEqual(events[-1]["type"], "response.incomplete")
+                for result in (json.loads(body), events[-1]["response"]):
+                    self.assertEqual(result["status"], "incomplete")
+                    self.assertEqual(result["incomplete_details"], {"reason": "max_output_tokens"})
+                    self.assertEqual(result["output_text"], "Partial answer")
+                    self.assertEqual([item["call_id"] for item in result["output"]
+                                      if item["type"] == "function_call"], expected_call_ids)
+
+    def test_web_stream_requires_an_upstream_finish_reason(self):
+        payload = {"model": "test-model", "input": "Summarize", "tools": [{"type": "web_search"}],
+                   "stream": True}
+        deltas = [{"content": "Partial answer"}]
+        for finish, done, expected in ((None, False, "failed"), (None, True, "failed"),
+                                       ("stop", False, "completed")):
+            with self.subTest(finish=finish, done=done):
+                body, _ = self.post(payload, deltas, finish, done=done)
+                events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+                terminal = [e for e in events if e["type"] in
+                            ("response.completed", "response.failed", "response.incomplete")]
+                self.assertEqual([e["type"] for e in terminal], ["response." + expected])
+                self.assertEqual(terminal[0]["response"]["id"], events[0]["response"]["id"])
+
+    def test_upstream_socket_error_is_a_response_failure(self):
+        class UpstreamReset(io.BytesIO):
+            def __iter__(self):
+                yield from iter(self.readline, b"")
+                raise ConnectionResetError("simulated upstream peer reset")
+
+        payload = {"model": "test-model", "input": "Summarize", "tools": [{"type": "web_search"}]}
+        deltas = [{"content": "Partial answer"}]
+        body, _ = self.post(dict(payload, stream=True), deltas, None,
+                            done=False, stream_factory=UpstreamReset)
+        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+        self.assertEqual([e["type"] for e in events],
+                         ["response.created", "response.in_progress", "response.failed"])
+        self.assertEqual(events[-1]["response"]["status"], "failed")
+        self.assertEqual(events[-1]["response"]["id"], events[0]["response"]["id"])
+        self.post(payload, deltas, None, expected_status=502, done=False,
+                  stream_factory=UpstreamReset)
 
 
 if __name__ == "__main__":

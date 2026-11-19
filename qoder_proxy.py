@@ -9753,13 +9753,14 @@ def iter_inner_sse(resp, holder=None):
         yield ("data: " + cleaned + "\n\n").encode("utf-8")
 
 
-def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None):
+def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None, *,
+                     require_terminal=False):
     """把上游信封流折叠成一个非流式 chat.completion 对象。
 
     allowed_names：本次请求声明的工具名集合；用于「泄漏文本回读」的守卫
     （见 parse_leaked_tool_calls / issue #8）。
     """
-    content, reasoning, finish = [], [], "stop"
+    content, reasoning, finish = [], [], None
     tool_calls_map = {}
     usage = holder.get("usage") if holder else None
     started = time.time()
@@ -9845,6 +9846,12 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
                         entry["function"]["arguments"] += fc["arguments"]
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
+
+    if require_terminal and finish not in ("stop", "tool_calls", "function_call",
+                                           "length", "content_filter"):
+        raise UpstreamStatus(502, "upstream ended without a completed response")
+    if finish is None:
+        finish = "stop"
 
     message = {"role": "assistant", "content": "".join(content)}
     if reasoning:
@@ -10563,6 +10570,7 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
         fn = tc.get("function") or {}
         call_id = tc.get("id") or _new_id("call_")
         name = fn.get("name") or ""
+        arguments = fn.get("arguments") or ""
         if name and name in custom_names:
             output.append(_stamp_tool_namespace({
                 "id": _new_id("ctc_"),
@@ -10570,7 +10578,7 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
-                "input": _unwrap_custom_input(fn.get("arguments") or ""),
+                "input": _unwrap_custom_input(arguments),
             }, ns_map))
         else:
             output.append(_stamp_tool_namespace({
@@ -10579,7 +10587,7 @@ def chat_to_response(chat_obj, model, custom_names=None, ns_map=None,
                 "status": "completed",
                 "call_id": call_id,
                 "name": name,
-                "arguments": fn.get("arguments") or "{}",
+                "arguments": "{}" if isinstance(arguments, str) and not arguments.strip() else arguments,
             }, ns_map))
     # DeepSeek DSML 工具调用回退
     if not (msg.get("tool_calls")):
@@ -10760,6 +10768,7 @@ def stream_responses_events(inner_lines, model, holder):
                         "id": c_id,
                         "name": fn_name,
                         "arguments": "",
+                        "arguments_started": False,
                         "custom": is_custom,
                         "item_id": _new_id("ctc_" if is_custom else "fc_"),
                     }
@@ -10785,12 +10794,14 @@ def stream_responses_events(inner_lines, model, holder):
                             entry["custom"] = True
                 if fn_args:
                     entry["arguments"] += fn_args
-                    if not entry["custom"]:
+                    if not entry["custom"] and (entry["arguments_started"] or fn_args.strip()):
+                        fragment = fn_args if entry["arguments_started"] else entry["arguments"]
+                        entry["arguments_started"] = True
                         yield ev("response.function_call_arguments.delta", {
                             "output_index": entry["output_index"],
                             "item_id": entry["item_id"],
                             "call_id": entry["id"],
-                            "delta": fn_args,
+                            "delta": fragment,
                         })
             piece = delta.get("content")
             if piece:
@@ -10943,11 +10954,20 @@ def stream_responses_events(inner_lines, model, holder):
                 "input": custom_input,
             }, (holder or {}).get("tool_ns"))
         else:
+            arguments = entry["arguments"]
+            if not entry["arguments_started"]:
+                arguments = "{}"
+                yield ev("response.function_call_arguments.delta", {
+                    "output_index": entry["output_index"],
+                    "item_id": entry["item_id"],
+                    "call_id": entry["id"],
+                    "delta": arguments,
+                })
             yield ev("response.function_call_arguments.done", {
                 "output_index": entry["output_index"],
                 "item_id": entry["item_id"],
                 "call_id": entry["id"],
-                "arguments": entry["arguments"],
+                "arguments": arguments,
             })
             fc_item = _stamp_tool_namespace({
                 "id": entry["item_id"],
@@ -10955,7 +10975,7 @@ def stream_responses_events(inner_lines, model, holder):
                 "status": "completed",
                 "call_id": entry["id"],
                 "name": entry["name"],
-                "arguments": entry["arguments"],
+                "arguments": arguments,
             }, (holder or {}).get("tool_ns"))
         outputs[entry["output_index"]] = fc_item
         yield ev("response.output_item.done",
@@ -13806,10 +13826,11 @@ class Handler(BaseHTTPRequestHandler):
             _round_t0 = time.time()
             try:
                 with resp:
-                    obj = aggregate_stream(resp, model, holder={"usage": None}, allowed_names=all_names)
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                raise
+                    obj = aggregate_stream(resp, model, holder={"usage": None},
+                                           allowed_names=all_names, require_terminal=True)
             except Exception:
+                # This block only consumes the upstream body. Socket errors
+                # here are source failures. Client write errors propagate.
                 return fail(502, "upstream stream failed")
             _u = obj.get("usage") or {}
             if _u:
@@ -13837,10 +13858,18 @@ class Handler(BaseHTTPRequestHandler):
                     for name, value in (_u.get(key) or {}).items():
                         if type(value) is int:
                             details[name] = details.get(name, 0) + value
-            msg = ((obj.get("choices") or [{}])[0].get("message") or {})
+            choice = (obj.get("choices") or [{}])[0]
+            msg = choice.get("message") or {}
             all_calls = msg.get("tool_calls") or []
             calls = [c for c in all_calls if (c.get("function") or {}).get("name") in names]
             if not calls:
+                break
+            if choice.get("finish_reason") == "length":
+                client_calls = [c for c in all_calls if (c.get("function") or {}).get("name") not in names]
+                if client_calls:
+                    msg["tool_calls"] = client_calls
+                else:
+                    msg.pop("tool_calls", None)
                 break
             if no_web:
                 return fail(502, "upstream requested a disabled web tool")

@@ -190,7 +190,9 @@ class ResponsesWebOutput:
 
     def __init__(self, payload, model, evidence, begin=None, write=None):
         self.payload = payload
-        self.model = model
+        self.requested_model = model
+        self.resolved_model = None
+        self.parallel_tool_calls = payload.get("parallel_tool_calls", True)
         self.evidence = evidence
         self.begin = begin
         self.write = write
@@ -201,14 +203,17 @@ class ResponsesWebOutput:
         self.started = False
         self.ended = False
 
-    def response(self, status="in_progress"):
+    def _response_fields(self):
         return {"id": self.id, "object": "response", "created_at": self.created_at,
-                "status": status, "model": self.model, "output": copy.deepcopy(self.items),
-                "output_text": "", "tools": self.payload.get("tools") or [],
+                "model": self.resolved_model or "", "requested_model": self.requested_model,
+                "resolved_model": self.resolved_model, "tools": self.payload.get("tools") or [],
                 "tool_choice": self.payload.get("tool_choice", "auto"),
-                "parallel_tool_calls": self.payload.get("parallel_tool_calls", True),
-                "metadata": self.payload.get("metadata") or {}, "error": None,
-                "incomplete_details": None}
+                "parallel_tool_calls": self.parallel_tool_calls,
+                "metadata": self.payload.get("metadata") or {}}
+
+    def response(self, status="in_progress"):
+        return dict(self._response_fields(), status=status, output=copy.deepcopy(self.items),
+                    output_text="", error=None, incomplete_details=None)
 
     def emit(self, kind, **data):
         if not self.write:
@@ -252,14 +257,14 @@ class ResponsesWebOutput:
 
     def enhance(self, response):
         response = copy.deepcopy(response)
+        actual = response.get("resolved_model")
+        if isinstance(actual, str) and actual.strip():
+            self.resolved_model = actual
         for item in response.get("output") or []:
             for part in item.get("content") or []:
                 if part.get("type") == "output_text":
                     part["annotations"] = self.evidence.annotations(part.get("text") or "")
-        response.update(id=self.id, created_at=self.created_at,
-                        tools=self.payload.get("tools") or [],
-                        tool_choice=self.payload.get("tool_choice", "auto"),
-                        metadata=self.payload.get("metadata") or {})
+        response.update(self._response_fields())
         response["output"] = copy.deepcopy(self.items) + response.get("output", [])
         return response
 
@@ -270,7 +275,7 @@ class ResponsesWebOutput:
             data = json.loads(raw.split("\ndata: ", 1)[1])
             kind = data.pop("type")
             data.pop("sequence_number", None)
-            if kind in ("response.created", "response.in_progress"):
+            if kind == "response.created":
                 continue
             if "output_index" in data:
                 data["output_index"] += len(self.items)
@@ -288,7 +293,10 @@ class ResponsesWebOutput:
                     if part.get("type") == "output_text":
                         part["annotations"] = self.evidence.annotations(part.get("text") or "")
             if "response" in data:
+                previous_model = self.resolved_model
                 data["response"] = self.enhance(data["response"])
+                if kind == "response.in_progress" and self.resolved_model == previous_model:
+                    continue
             self.emit(kind, **data)
         self.ended = True
 
