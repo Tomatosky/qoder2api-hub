@@ -78,6 +78,13 @@ class OfficialWebTests(unittest.TestCase):
         self.assertNotIn(self.acc.access_token, str(kwargs))
         self.assertEqual(kwargs["retries"], 1)
         self.assertEqual(kwargs["timeout"], 15)
+        self.assertIs(kwargs["follow_redirects"], False)
+
+    def test_signed_transport_installs_no_redirect_policy(self):
+        opener = A._opener_for_request(follow_redirects=False)
+        handlers = opener.handle_error["http"][302]
+        self.assertEqual(len(handlers), 1)
+        self.assertIsNone(handlers[0].redirect_request(None, None, 302, "", {}, ""))
 
     def test_missing_other_realm_and_vpc_rejected_without_network(self):
         for acc in [None, account(realm="unknown"), account(vpc=True),

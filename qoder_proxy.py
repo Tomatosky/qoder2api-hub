@@ -8994,22 +8994,30 @@ def rewrite_web_tools(tools, names):
 
 def _chat_chunks(obj, model):
     """把聚合好的 chat 对象摊成 SSE 分片（web 工具路径用：内容是整段回放）。"""
-    cid = (obj or {}).get("id") or "chatcmpl-web"
-    created = int((obj or {}).get("created") or time.time())
-    mdl = (obj or {}).get("model") or model or ""
-    text = (((obj or {}).get("choices") or [{}])[0].get("message") or {}).get(
-        "content") or ""
-    base = {"id": cid, "object": "chat.completion.chunk",
-            "created": created, "model": mdl}
-    yield dict(base, choices=[{"index": 0, "delta": {"role": "assistant"},
-                               "finish_reason": None}])
+    obj = obj or {}
+    choice = (obj.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    base = {"id": obj.get("id") or "chatcmpl-web", "object": "chat.completion.chunk",
+            "created": int(obj.get("created") or time.time()),
+            "model": obj.get("model") or model or ""}
+
+    def chunk(delta, finish_reason=None):
+        return dict(base, choices=[{"index": 0, "delta": delta, "finish_reason": finish_reason}])
+
+    yield chunk({"role": "assistant"})
+    text = message.get("content")
     if text:
-        yield dict(base, choices=[{"index": 0, "delta": {"content": text},
-                                   "finish_reason": None}])
-    tail = dict(base, choices=[{"index": 0, "delta": {},
-                                "finish_reason": "stop"}])
-    if (obj or {}).get("usage"):
-        tail["usage"] = (obj or {}).get("usage")
+        yield chunk({"content": text})
+    for index, call in enumerate(message.get("tool_calls") or []):
+        function = call["function"]
+        yield chunk({"tool_calls": [{"index": index, "id": call["id"], "type": call["type"],
+                                     "function": {"name": function["name"], "arguments": ""}}]})
+        if function.get("arguments"):
+            yield chunk({"tool_calls": [{"index": index, "function": {
+                "arguments": function["arguments"]}}]})
+    tail = chunk({}, choice.get("finish_reason") or "stop")
+    if obj.get("usage"):
+        tail["usage"] = obj["usage"]
     yield tail
 
 
@@ -10786,6 +10794,7 @@ def stream_responses_events(inner_lines, model, holder):
                         else:
                             yield ev("response.function_call_arguments.delta", {
                                 "output_index": entry["output_index"],
+                                "item_id": entry["item_id"],
                                 "call_id": entry["id"],
                                 "delta": fn_args,
                             })
@@ -10932,6 +10941,7 @@ def stream_responses_events(inner_lines, model, holder):
         else:
             yield ev("response.function_call_arguments.done", {
                 "output_index": entry["output_index"],
+                "item_id": entry["item_id"],
                 "call_id": entry["id"],
                 "arguments": entry["arguments"],
             })
@@ -13711,8 +13721,9 @@ class Handler(BaseHTTPRequestHandler):
             chat_req = (responses_to_chat(payload, hosted_web=True) if is_responses else dict(payload))
             chat_req = dict(chat_req)
             original_tools = chat_req.get("tools") or []
-            ordinary_names = {t.get("function", {}).get("name") for t in original_tools
-                              if isinstance(t, dict) and t.get("type") == "function"}
+            ordinary_names = {_tool_declared_name(t) for t in original_tools
+                              if isinstance(t, dict) and t.get("type") in (None, "function")}
+            ordinary_names.discard("")
             if ordinary_names & names:
                 raise ValueError("client function names conflict with hosted web tools")
             chat_req["tools"] = rewrite_web_tools(original_tools, names)
@@ -13755,7 +13766,7 @@ class Handler(BaseHTTPRequestHandler):
         calls_used = 0
         _acc = {}
         _details = {"prompt_tokens_details": {}, "completion_tokens_details": {}}
-        all_names = names | {n for n in ordinary_names if n}
+        all_names = names | ordinary_names
         round_limit = max(1, WEB_TOOLS_MAX_ROUNDS)
         # Reserve a synthesis turn after the last allowed tool round. Previously
         # the last tool results were discarded and its pending calls leaked out.
@@ -13765,7 +13776,7 @@ class Handler(BaseHTTPRequestHandler):
                       or chat_req.get("tool_choice") == "none")
             if no_web:
                 req["tools"] = [t for t in req["tools"]
-                                if (t.get("function") or {}).get("name") not in names]
+                                if _tool_declared_name(t) not in names]
                 req["tool_choice"] = ("none" if chat_req.get("tool_choice") == "none"
                                       or not req["tools"] else "auto")
             elif turn:
@@ -13870,14 +13881,14 @@ class Handler(BaseHTTPRequestHandler):
                     message["annotations"] = [{"type": "url_citation", "url_citation": {
                         k: v for k, v in citation.items() if k != "type"}} for citation in citations]
         if is_responses:
+            custom_names = custom_tool_names(declared_tools)
+            tool_ns = chat_req.get("_qd_tool_ns") or {}
             if not want_stream:
                 return self._json(200, web_output.enhance(chat_to_response(obj, model,
-                    custom_names=custom_tool_names(original_tools), ns_map=chat_req.get("_qd_tool_ns") or {},
-                    allowed_names=all_names)))
+                    custom_names=custom_names, ns_map=tool_ns, allowed_names=all_names)))
             web_output.stream_final(stream_responses_events(
                 _chat_chunks_iter(obj, model), model, {"usage": obj.get("usage"),
-                    "custom_names": custom_tool_names(original_tools),
-                    "tool_ns": chat_req.get("_qd_tool_ns") or {}, "allowed_names": all_names}))
+                    "custom_names": custom_names, "tool_ns": tool_ns, "allowed_names": all_names}))
             return
         if not want_stream:
             return self._json(200, obj)
@@ -14487,7 +14498,10 @@ class Handler(BaseHTTPRequestHandler):
                 _additional, _ = _flatten_ns_tools(_additional_tools_from_input(payload.get("input")))
                 _web_names.update(builtin_web_tool_names(_additional))
             if _web_names:
-                return self._handle_web_tools(path, payload, _web_names)
+                try:
+                    return self._handle_web_tools(path, payload, _web_names)
+                finally:
+                    self._sse_end()
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
         if path in ("/v1/messages", "/v1/messages/count_tokens"):

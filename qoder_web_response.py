@@ -1,5 +1,6 @@
 """Request-scoped web evidence and Responses events; no provider dependencies."""
 import copy
+import hashlib
 import html
 import ipaddress
 import json
@@ -150,8 +151,13 @@ class WebEvidence:
                     self.sources[url_key(result["url"])] = source
         return result
 
-    def cache_key(self, name, args, account, backend):
-        return (backend, getattr(account, "uid", ""), name,
+    def cache_key(self, name, args, account, backend, origin=""):
+        scope = (getattr(account, "uid", ""), getattr(account, "realm", ""), origin)
+        if origin:
+            token = account.access_token
+            scope += (getattr(account, "organization_id", ""),
+                      hashlib.sha256(token.encode("utf-8")).digest())
+        return (backend, scope, name,
                 json.dumps(args, ensure_ascii=False, sort_keys=True))
 
     def render(self, text):

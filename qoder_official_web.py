@@ -24,7 +24,8 @@ class OfficialWebError(Exception):
     """A safe-to-display error; never includes credentials or raw server bodies."""
 
 
-def _request(account, path, payload):
+def service_origin(account):
+    """Resolve the HTTPS origin for this account's official web tools."""
     if account is None or not getattr(account, "access_token", ""):
         raise OfficialWebError("official web tools require an authenticated account")
     realm = getattr(account, "realm", "")
@@ -43,7 +44,11 @@ def _request(account, path, payload):
             or parsed.username is not None or parsed.password is not None
             or parsed.path or parsed.query or parsed.fragment):
         raise OfficialWebError("invalid official web gateway configuration")
-    url = origin + path + "?Encode=1"
+    return origin
+
+
+def _request(account, path, payload):
+    url = service_origin(account) + path + "?Encode=1"
     envelope = {"payload": json.dumps(payload, ensure_ascii=False,
                                        separators=(",", ":")),
                 "encodeVersion": "1"}
@@ -52,10 +57,11 @@ def _request(account, path, payload):
     headers = SESSIONS.get(account).headers(
         body, url, sse=False, accept="application/json")
     try:
-        # Shared transport honors the deployment's proxy and URL policy. Do not
-        # retry billable tools automatically or silently fall back to local search.
+        # The signature binds the request path. Keep the signed POST at its
+        # original URL and avoid automatic retries for billable tools.
         result = qoder_accounts.http_json(
-            url, data=body.encode("ascii"), headers=headers, timeout=15, retries=1)
+            url, data=body.encode("ascii"), headers=headers, timeout=15, retries=1,
+            follow_redirects=False)
     except urllib.error.HTTPError as exc:
         status = exc.code
         exc.close()

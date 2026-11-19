@@ -13,6 +13,7 @@ Qoder 上游只认 function 类型，这类声明此前被直接丢弃（#63）�
   · 响应体与正文都有字节上限，超时固定；
   · 引擎链轮换 + TTL 缓存 + single-flight + 冷却，避免被限流。
 """
+import copy
 import ipaddress
 import http.client
 import html
@@ -483,12 +484,23 @@ def run_tool(name, arguments, account=None, context=None, on_result=None, config
     official = None
     if backend == "qoder" and name in (WEB_SEARCH_NAME, WEB_FETCH_NAME):
         import qoder_official_web as official
-    cache_key = context.cache_key(name, args, account, backend) if context else None
+    origin = ""
+    if context and official:
+        # A background token refresh can update the account between rounds.
+        # Use the same credentials for the cache lookup and signed request.
+        account = copy.copy(account)
+        try:
+            origin = official.service_origin(account)
+        except (official.OfficialWebError, ValueError):
+            # Let the backend return its normal error without consulting the cache.
+            pass
+    cache_key = (context.cache_key(name, args, account, backend, origin)
+                 if context and (not official or origin) else None)
 
     def observe(res):
         if context:
             res = context.observe(name, res)
-            if res.get("ok"):
+            if cache_key is not None and res.get("ok"):
                 context.cache[cache_key] = res
         if on_result:
             on_result(res)
