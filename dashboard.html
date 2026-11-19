@@ -3657,7 +3657,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
   <div id="schedulerBar" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 14px;margin-bottom:16px;font-size:12px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
     <div style="display:flex;align-items:center;gap:8px">
       <span class="dot" id="schedDot"></span>
-      <span>后台定时调度器: <b id="schedStatusText">待查询</b></span>
+      <span>自动签到 / Token 保活: <b id="schedStatusText">待查询</b></span>
       <span style="color:var(--dim);font-size:11px" id="schedTimes"></span>
     </div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -3665,6 +3665,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
       <button class="sec mini" id="btnTriggerSched" onclick="triggerSchedulerNow(this)">立即巡检保活</button>
       <button class="sec mini" id="btnToggleSched" onclick="toggleScheduler(this)">暂停调度</button>
     </div>
+    <div style="width:100%;color:var(--dim);font-size:11px">自动签到默认每日 09:00 / 21:00，按下方服务端时区执行；可在排程设置修改。网关需保持运行，暂停后不会自动签到；“立即巡检保活”也会补签符合条件的账号，结果见调度器日志。</div>
     <div id="schedEditor" style="display:none;width:100%;margin-top:8px;padding-top:10px;border-top:1px dashed var(--line)">
       <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">
         <div id="schedDialWrap" style="flex:0 0 auto"></div>

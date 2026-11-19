@@ -23,6 +23,8 @@ import qoder_settings as S
 import qoder_webtools as W
 import qoder_web_response as R
 
+P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
+
 
 class FakeSearch(http.server.BaseHTTPRequestHandler):
     def do_GET(self):

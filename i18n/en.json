@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 22
+    "version": 23
   },
   "messages": {
     "国内版服务入口": "China service endpoint",
@@ -72,7 +72,8 @@
     "锁定国内": "Lock to CN",
     "锁定国际": "Lock to Intl",
     "本次实际出口：—": "Actual egress this call: —",
-    "后台定时调度器:": "Background scheduler:",
+    "自动签到 / Token 保活:": "Automatic check-in / Token keepalive:",
+    "自动签到默认每日 09:00 / 21:00，按下方服务端时区执行；可在排程设置修改。网关需保持运行，暂停后不会自动签到；“立即巡检保活”也会补签符合条件的账号，结果见调度器日志。": "Automatic check-in runs daily at 09:00 / 21:00 in the server timezone shown below; change it in Schedule settings. Keep the gateway running. Pausing stops automatic check-in; Run inspection also checks eligible accounts. See scheduler logs for results.",
     "运行中": "Running",
     "排程设置": "Schedule settings",
     "立即巡检保活": "Run inspection now",
@@ -915,7 +916,7 @@
     "检查失败：{0}": "Check failed: {0}",
     "自动滚屏: {0}": "Auto-scroll: {0}",
     "第 {0} / {1} 页 · 共 {2} 条记录": "Page {0} / {1} · {2} records",
-    "后台定时调度器: {0}": "Background scheduler: {0}",
+    "自动签到 / Token 保活: {0}": "Automatic check-in / Token keepalive: {0}",
     "颜色主题: {0}": "Color theme: {0}",
     "跟随系统 (当前{0})": "Follow system (currently {0})",
     "临期优先窗口 {0} 天（本号在窗口内，优先派发）": "Expiring-first window: {0} days (this account is inside the window and gets priority)",

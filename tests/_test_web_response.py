@@ -25,6 +25,10 @@ import qoder_proxy as P
 import qoder_web_response as R
 import qoder_webtools as W
 
+# Importing qoder_proxy does not run main(), so env alone cannot bind its directory.
+# Keep real HTTP auth/settings reads inside this suite, even in a configured checkout.
+P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
+
 
 def reply(text="", calls=None, usage=None):
     return {"choices": [{"index": 0, "message": {"role": "assistant", "content": text,

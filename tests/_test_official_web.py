@@ -26,6 +26,8 @@ import qoder_webtools as W
 from qoder_sign import qoder_decode
 from qoder_web_response import WebEvidence
 
+P.ACCOUNTS_DIR = os.environ["ACCOUNTS_DIR"]
+
 
 def account(uid="test-one", realm="cn", vpc=False, gateway=None):
     return SimpleNamespace(
