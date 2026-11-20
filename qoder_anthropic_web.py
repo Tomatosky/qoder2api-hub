@@ -5,7 +5,10 @@ import hmac
 import json
 import re
 import secrets
+import threading
+import time
 import uuid
+from collections import OrderedDict
 
 import qoder_anthropic
 import qoder_settings
@@ -16,7 +19,12 @@ from qoder_webtools import format_search_result
 _TYPES = {"web_search_20250305": "web_search", "web_fetch_20250910": "web_fetch"}
 _RESULT_TYPES = {name: name + "_tool_result" for name in _TYPES.values()}
 _ID_PREFIX = "srvtoolu_qd_"
+_DEFERRED_PREFIX = _ID_PREFIX + "pending_"
 _FALLBACK_REPLAY_KEY = secrets.token_bytes(32)
+_DEFERRED_TTL = 600
+_DEFERRED_MAX = 128
+_deferred = OrderedDict()
+_deferred_lock = threading.Lock()
 
 
 def error_body(status, message):
@@ -68,10 +76,12 @@ def applies(payload):
 class WebRequest:
     def __init__(self, payload, scope, accounts_dir):
         self.scope = scope
+        self.model = payload.get("model")
         self.accounts_dir = accounts_dir
         self._replay_key = None
         self.limits = {}
         self.usage = {}
+        self.used_before = {}
         filters = {}
         ordinary = []
         for tool in payload.get("tools") or []:
@@ -98,7 +108,70 @@ class WebRequest:
             self.limits[name] = min(limit, 32)
         self.evidence = WebEvidence(tool_filters=filters)
         self.prior_urls = set()
-        self.payload = dict(payload, tools=ordinary, messages=self._restore(payload.get("messages") or []))
+        messages, self.resume = self._join_deferred(payload.get("messages") or [])
+        self.payload = dict(payload, tools=ordinary, messages=self._restore(messages))
+
+    def defer(self, calls, client_calls, account, config):
+        batch = DeferredWeb(self, calls, client_calls, account, config)
+        with _deferred_lock:
+            _prune_deferred()
+            _deferred[batch.id] = batch
+            while len(_deferred) > _DEFERRED_MAX:
+                _deferred.popitem(last=False)
+        return batch
+
+    def _join_deferred(self, messages):
+        assistant_blocks = {i: _blocks(message) for i, message in enumerate(messages)
+                            if isinstance(message, dict) and message.get("role") == "assistant"
+                            and isinstance(message.get("content"), (list, dict))}
+        calls = {block["id"]: (i, block) for i, blocks in assistant_blocks.items() for block in blocks
+                 if block.get("type") == "server_tool_use"
+                 and str(block.get("id") or "").startswith(_DEFERRED_PREFIX)}
+        if not calls:
+            return messages, None
+        # Anthropic returns results for a deferred batch in the next assistant message.
+        # Put each paired call beside its result for Chat history conversion.
+        edited = dict(assistant_blocks)
+        awaiting = dict(calls)
+        for i, blocks in assistant_blocks.items():
+            paired = []
+            for block in blocks:
+                key = str(block.get("tool_use_id") or "")
+                if block.get("type") in _RESULT_TYPES.values() and key in awaiting:
+                    origin, call = awaiting[key]
+                    if origin < i:
+                        paired.append(call)
+                        awaiting.pop(key)
+            if paired:
+                edited[i] = paired + blocks
+        for i, blocks in edited.items():
+            edited[i] = [block for block in blocks if not (
+                block.get("type") == "server_tool_use" and str(block.get("id") or "") in calls
+                and calls[block["id"]][0] == i)]
+        rewritten = [dict(message, content=edited[i]) if i in edited else message
+                     for i, message in enumerate(messages)]
+        if not awaiting:
+            return rewritten, None
+        origin, call = next(iter(awaiting.values()))
+        if origin != len(messages) - 2 or not isinstance(messages[-1], dict) or messages[-1].get("role") != "user":
+            raise ValueError("pending web tools require the preceding client tool results")
+        batch_id = call["id"].rsplit("_", 1)[0]
+        with _deferred_lock:
+            _prune_deferred()
+            batch = _deferred.get(batch_id)
+        if batch is None or batch.scope != self.scope or batch.model != self.model:
+            raise ValueError("pending web tool continuation is unavailable")
+        if self.limits != batch.limits or self.evidence.tool_filters != batch.filters:
+            raise ValueError("pending web tools require the original web tool declarations")
+        results = [block.get("tool_use_id") for block in _blocks(messages[-1])
+                   if block.get("type") == "tool_result"]
+        ordinary = {str(block.get("id") or "") for block in assistant_blocks[origin]
+                    if block.get("type") == "tool_use"}
+        if ordinary != batch.client_ids or len(results) != len(batch.client_ids) or set(results) != batch.client_ids:
+            raise ValueError("pending web tools require all client tool results")
+        if awaiting != {block["id"]: (origin, block) for block in batch.blocks}:
+            raise ValueError("pending web tool calls were modified")
+        return rewritten, batch
 
     @property
     def replay_key(self):
@@ -178,7 +251,7 @@ class WebRequest:
         return converted
 
     def unavailable(self, name, arguments):
-        if self.usage.get(name, 0) >= self.limits[name]:
+        if self.used_before.get(name, 0) + self.usage.get(name, 0) >= self.limits[name]:
             return "max_uses_exceeded"
         params = parse_arguments(arguments)
         if name == "web_search":
@@ -192,6 +265,46 @@ class WebRequest:
         if url_key(url) not in self.prior_urls and url_key(url) not in self.evidence.sources:
             return "url_not_in_prior_context"
         return None
+
+
+def _prune_deferred():
+    now = time.monotonic()
+    while _deferred and next(iter(_deferred.values())).expires_at <= now:
+        _deferred.popitem(last=False)
+
+
+class DeferredWeb:
+    def __init__(self, request, calls, client_calls, account, config):
+        self.id = _DEFERRED_PREFIX + uuid.uuid4().hex
+        self.expires_at = time.monotonic() + _DEFERRED_TTL
+        self.scope = request.scope
+        self.model = request.model
+        self.limits = dict(request.limits)
+        self.filters = request.evidence.tool_filters
+        self.usage = {name: request.used_before.get(name, 0) + request.usage.get(name, 0)
+                      for name in request.limits}
+        self.account = account
+        self.config = config
+        self.identity = self.account_identity(account)
+        self.client_ids = {call["id"] for call in client_calls}
+        self.blocks = [dict(type="server_tool_use", id=self.id + "_" + str(i),
+                            name=call["function"]["name"], input=parse_arguments(call["function"].get("arguments")))
+                       for i, call in enumerate(calls)]
+        self.lock = threading.Lock()
+        self.results = []
+
+    def account_identity(self, account):
+        if self.config["backend"] != "qoder":
+            return None
+        import qoder_official_web
+
+        try:
+            origin = qoder_official_web.service_origin(account)
+        except (qoder_official_web.OfficialWebError, ValueError):
+            origin = ""
+        credential = str(getattr(account, "access_token", "") or "").encode()
+        return (getattr(account, "uid", ""), getattr(account, "realm", ""), origin,
+                getattr(account, "organization_id", ""), hashlib.sha256(credential).digest())
 
 
 class WebOutput:
@@ -258,6 +371,9 @@ class WebOutput:
 
     def tool_done(self, index, result):
         call = self.blocks[index]
+        self.tool_result(call, result)
+
+    def tool_result(self, call, result):
         tool_id, name = call["id"], call["name"]
         if not result.get("ok"):
             content = {"type": name + "_tool_result_error", "error_code": result.get("error_code", "unavailable")}

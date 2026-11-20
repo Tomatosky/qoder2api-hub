@@ -14080,6 +14080,86 @@ class Handler(BaseHTTPRequestHandler):
         _details = {"prompt_tokens_details": {}, "completion_tokens_details": {}}
         all_names = names | ordinary_names
         round_limit = max(1, WEB_TOOLS_MAX_ROUNDS)
+        resume = web_request.resume if web_request else None
+
+        def web_error(name, arguments):
+            if calls_used >= call_limit:
+                return "max_uses_exceeded"
+            return web_request.unavailable(name, arguments) if web_request else None
+
+        def count_web(name):
+            nonlocal calls_used
+            calls_used += 1
+            if web_request:
+                web_request.usage[name] = web_request.usage.get(name, 0) + 1
+
+        def execute_web(name, arguments, account, error):
+            if error:
+                return (json.dumps({"error": error if web_request else "web tool budget exhausted"}),
+                        {"ok": False, "error_code": error})
+            count_web(name)
+            observed = []
+            try:
+                result = qoder_webtools.run_tool(name, arguments, account=account,
+                    context=evidence, on_result=observed.append, config=web_config)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                raise
+            except (ValueError, TypeError) as exc:
+                result = json.dumps({"error": str(exc)[:200]}, ensure_ascii=False)
+            except Exception:
+                result = json.dumps({"error": "web tool execution failed"})
+            return result, observed[-1] if observed else {"ok": False}
+
+        if resume:
+            account = resume.account
+            if web_disabled_by_choice or web_config != resume.config:
+                return fail(400, "pending web tools require unchanged web settings")
+            if POOL is not None:
+                if POOL.get(account.uid) is not account or not account.enabled:
+                    return fail(403, "pending web tool account is no longer available")
+                try:
+                    route = qoder_routing.resolve(ACCOUNTS_DIR, list(POOL.accounts), model,
+                        key=usage_ctx["_key_entry"] or {}, explicit_realm=realm or account.realm)
+                except ValueError:
+                    return fail(403, "pending web tool account is outside routing scope")
+                allowed = route["allowed_uids"]
+                if (allowed is not None and account.uid not in allowed) or route["realm"] not in (None, "", account.realm):
+                    return fail(403, "pending web tool account is outside routing scope")
+            realm = account.realm
+            self.realm_used = realm
+            web_request.used_before = resume.usage
+            calls_used = sum(resume.usage.values())
+            pending = {"role": "assistant", "content": "", "tool_calls": []}
+            tool_results = []
+            output_blocks = []
+            # Cache completed calls of this batch so concurrent continuations do not
+            # re-run search before receiving their own synthesis response.
+            with resume.lock:
+                tool_account = copy.copy(account)
+                if resume.account_identity(tool_account) != resume.identity:
+                    return fail(409, "pending web tool account credentials changed")
+                for index, block in enumerate(resume.blocks):
+                    name, arguments = block["name"], block["input"]
+                    if index < len(resume.results):
+                        result, observed, admitted = resume.results[index]
+                        if admitted:
+                            count_web(name)
+                        observed = evidence.observe(name, observed)
+                        if name == qoder_webtools.WEB_SEARCH_NAME and observed.get("ok"):
+                            result = qoder_webtools.format_search_result(observed)
+                    else:
+                        error = web_error(name, arguments)
+                        result, observed = execute_web(name, arguments, tool_account, error)
+                        resume.results.append((result, observed, error is None))
+                    pending["tool_calls"].append({"id": block["id"], "type": "function",
+                        "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}})
+                    tool_results.append({"role": "tool", "tool_call_id": block["id"], "content": result})
+                    output_blocks.append((block, observed))
+            for block, observed in output_blocks:
+                web_output.tool_result(block, observed)
+            insert_at = len(messages) - 1 if messages and messages[-1].get("role") == "user" else len(messages)
+            messages[insert_at:insert_at] = [pending] + tool_results
+            forced_web = None
         # Reserve a synthesis turn after the last allowed tool round. Previously
         # the last tool results were discarded and its pending calls leaked out.
         for turn in range(round_limit + 1):
@@ -14090,7 +14170,7 @@ class Handler(BaseHTTPRequestHandler):
                                 if _tool_declared_name(t) not in names]
                 req["tool_choice"] = ("none" if web_disabled_by_choice
                                       or not req["tools"] else "auto")
-            elif turn:
+            elif turn or resume:
                 # A required/forced search applies to the first turn, not forever.
                 req["tool_choice"] = "auto"
             elif forced_web:
@@ -14100,7 +14180,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 resp, account, _ = open_upstream(
                     req, target_realm=realm, usage_ctx=usage_ctx,
-                    session_key=session_key)
+                    session_key=session_key, **({"only_account": resume.account} if resume else {}))
             except RateLimited as exc:
                 if web_output and web_output.started:
                     return fail(429, "upstream rate limit reached")
@@ -14176,40 +14256,36 @@ class Handler(BaseHTTPRequestHandler):
                 break
             if no_web:
                 return fail(502, "upstream requested a disabled web tool")
-            if len(calls) != len(all_calls):
-                return fail(502, "upstream mixed hosted and client tools; retry without parallel tool calls")
+            client_calls = [call for call in all_calls if call not in calls]
+            if client_calls and web_request:
+                client_ids = {call.get("id") for call in client_calls}
+                if None in client_ids or "" in client_ids or len(client_ids) != len(client_calls):
+                    return fail(502, "upstream client tool calls require unique IDs")
+                deferred = web_request.defer(calls, client_calls, account, web_config)
+                for block in deferred.blocks:
+                    web_output.append(block)
+                msg["tool_calls"] = client_calls
+                choice["finish_reason"] = "tool_calls"
+                break
             rounds += 1
             log("web tools: round %d, %d call(s) -> gateway execution" % (rounds, len(calls)), tag="webtools")
-            assistant = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": all_calls}
+            assistant = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls}
             if msg.get("reasoning_content"):
                 assistant["reasoning_content"] = msg["reasoning_content"]
             messages.append(assistant)
             for call in calls:
                 fn = call.get("function") or {}
                 name, arguments = fn.get("name"), fn.get("arguments")
-                error_code = ("max_uses_exceeded" if calls_used >= call_limit else
-                              web_request.unavailable(name, arguments) if web_request else None)
+                error_code = web_error(name, arguments)
                 index = web_output.tool_start(name, arguments, executing=error_code is None) if web_output else None
-                observed = []
-                try:
-                    if error_code:
-                        result = json.dumps({"error": error_code if web_request else "web tool budget exhausted"})
-                        observed.append({"ok": False, "error_code": error_code})
-                    else:
-                        calls_used += 1
-                        if web_request:
-                            web_request.usage[name] = web_request.usage.get(name, 0) + 1
-                        result = qoder_webtools.run_tool(name, arguments,
-                            account=account, context=evidence, on_result=observed.append, config=web_config)
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                    raise
-                except (ValueError, TypeError) as exc:
-                    result = json.dumps({"error": str(exc)[:200]}, ensure_ascii=False)
-                except Exception:
-                    result = json.dumps({"error": "web tool execution failed"})
+                result, observed = execute_web(name, arguments, account, error_code)
                 if web_output:
-                    web_output.tool_done(index, observed[-1] if observed else {"ok": False})
+                    web_output.tool_done(index, observed)
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": result})
+            if client_calls:
+                msg["tool_calls"] = client_calls
+                choice["finish_reason"] = "tool_calls"
+                break
         obj = copy.deepcopy(obj or {"choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}]})
         if _acc:
             _usage = dict(obj.get("usage") or {})

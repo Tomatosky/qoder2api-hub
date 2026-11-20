@@ -81,7 +81,7 @@ export ANTHROPIC_MODEL="Qwen3.8-Max"
 | 流式请求出错不会重试 | `message_start` 已经发出后不能重新开始，网关会发送 `event: error` 结束这次请求。非流式请求仍然正常重试 |
 | `count_tokens` 是本地估算 | 不会请求上游 |
 
-开启网关 Web 工具后，`/v1/messages` 支持服务端声明 `web_search_20250305` 和 `web_fetch_20250910`，后端沿用面板的搜索配置。Claude Code 自带的 `WebFetch` 仍由客户端执行。同批混合服务端和客户端工具暂不支持。
+开启网关 Web 工具后，`/v1/messages` 支持服务端声明 `web_search_20250305` 和 `web_fetch_20250910`，后端沿用面板的搜索配置。Claude Code 自带的 `WebFetch` 仍由客户端执行。如果同批调用还有客户端工具，网关会等客户端带回工具结果后再执行搜索或抓取。待执行的调用保留在当前网关进程，客户端需要在 10 分钟内续传。
 
 搜索结果可随会话历史回传。重启网关后继续使用原历史，需保留网关设置和同一个 API Key、区域。
 

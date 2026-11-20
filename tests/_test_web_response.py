@@ -383,6 +383,19 @@ class HostedWebHandlerTests(unittest.TestCase):
         self.assertEqual(obj["output"][0]["name"], "client_shell")
         self.http.assert_not_called()
 
+    def test_responses_mixed_batch_searches_then_returns_original_client_call(self):
+        ordinary = call("lookup_order", {"order": 17}, "call_order")
+        tools = [{"type": "web_search"}, {"type": "function", "name": "lookup_order",
+                  "parameters": {"type": "object"}}]
+        _, events, requests, _ = self.run_handler([reply(calls=[call(), ordinary])], {"tools": tools}, stream=True)
+        items = events[-1]["response"]["output"]
+        self.assertEqual([item["type"] for item in items], ["web_search_call", "function_call"])
+        self.assertEqual((items[1]["call_id"], items[1]["name"], json.loads(items[1]["arguments"])),
+                         ("call_order", "lookup_order", {"order": 17}))
+        self.assertEqual(events[-1]["type"], "response.completed")
+        self.assertEqual(len(requests), 1)
+        self.http.assert_called_once()
+
     def test_chat_annotations_use_chat_schema(self):
         (status, obj), _, _, _ = self.run_handler([reply(calls=[call()]), reply("[S1]")], protocol="chat")
         annotation = obj["choices"][0]["message"]["annotations"][0]
@@ -435,8 +448,8 @@ class HostedWebHTTPTests(unittest.TestCase):
         run_tool.assert_not_called()
         return body, infer.call_args.args[0]
 
-    def post_anthropic(self, payload, rounds, *, expected_status=200, fetched=None):
-        account = SimpleNamespace(uid="test-scope", access_token="fake-test-token", realm="cn",
+    def post_anthropic(self, payload, rounds, *, expected_status=200, fetched=None, account=None):
+        account = account or SimpleNamespace(uid="test-scope", access_token="fake-test-token", realm="cn",
             realm_config=lambda: {"gateway": "https://gateway.qoder.com.cn", "vpc_instance": ""})
         upstreams = []
         for items in rounds:
@@ -522,6 +535,61 @@ class HostedWebHTTPTests(unittest.TestCase):
         body, _, count = self.post_anthropic(payload, rounds)
         self.assertEqual(json.loads(body)["content"][1]["content"]["error_code"], "url_not_in_prior_context")
         self.assertEqual(count, 0)
+
+    def test_anthropic_mixed_batch_waits_for_client_results_and_replays_once(self):
+        account = SimpleNamespace(uid="continuation-account", access_token="fake-test-token", realm="cn",
+            realm_config=lambda: {"gateway": "https://gateway.qoder.com.cn", "vpc_instance": ""})
+        search = {"type": "web_search_20250305", "name": "web_search", "max_uses": 1}
+        lookup = {"name": "lookup_order", "input_schema": {"type": "object"}}
+        original = {"model": "test-model", "max_tokens": 100, "tools": [search, lookup],
+                    "messages": [{"role": "user", "content": "Check the order and look it up."}]}
+        mixed = self.anthropic_round({"tool_calls": [dict(call(), index=0),
+            dict(call("lookup_order", {"order": 17}, "call_order"), index=1)]}, "tool_calls")
+        body, _, count = self.post_anthropic(original, [mixed], account=account)
+        response = json.loads(body)
+        pending, external = response["content"]
+        self.assertEqual((count, response["stop_reason"]), (0, "tool_use"))
+        self.assertEqual(pending["type"], "server_tool_use")
+        self.assertEqual((external["type"], external["id"], external["input"]),
+                         ("tool_use", "call_order", {"order": 17}))
+        prior = original["messages"] + [{"role": "assistant", "content": response["content"]}]
+        resume = dict(original, messages=prior + [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "call_order", "content": "Order 17 exists"}]}])
+        invalid = copy.deepcopy(resume)
+        invalid["messages"][-1]["content"][0]["tool_use_id"] = "another_call"
+        _, requests, count = self.post_anthropic(invalid, [], expected_status=400)
+        self.assertEqual((requests, count), ([], 0))
+        tampered = copy.deepcopy(resume)
+        tampered["messages"][-2]["content"][0]["input"]["query"] = "changed query"
+        _, requests, count = self.post_anthropic(tampered, [], expected_status=400)
+        self.assertEqual((requests, count), ([], 0))
+        answer = self.anthropic_round({"content": "See [S1] for order 17."})
+        body, requests, count = self.post_anthropic(resume, [answer])
+        continuation = json.loads(body)
+        result, text = continuation["content"]
+        self.assertEqual((count, result["type"], result["tool_use_id"]),
+                         (1, "web_search_tool_result", pending["id"]))
+        self.assertEqual(continuation["stop_reason"], "end_turn")
+        self.assertEqual(text["citations"][0]["url"], result["content"][0]["url"])
+        self.assertEqual([message["tool_call_id"] for message in requests[0]["messages"]
+                          if message["role"] == "tool"], ["call_order", pending["id"]])
+        self.assertNotIn("web_search", [tool["function"]["name"] for tool in requests[0]["tools"]])
+        body, _, count = self.post_anthropic(dict(resume, stream=True), [answer])
+        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+        blocks = [event["content_block"] for event in events if event["type"] == "content_block_start"]
+        self.assertEqual((count, blocks[0]["type"], blocks[0]["tool_use_id"]),
+                         (0, "web_search_tool_result", pending["id"]))
+        self.assertEqual(events[-1]["type"], "message_stop")
+        account.access_token = "different-fake-token"
+        body, requests, count = self.post_anthropic(resume, [], expected_status=409)
+        self.assertIn("account credentials changed", json.loads(body)["error"]["message"])
+        self.assertEqual((requests, count), ([], 0))
+        history = resume["messages"] + [{"role": "assistant", "content": continuation["content"]},
+                                        {"role": "user", "content": "Explain the reference."}]
+        _, requests, count = self.post_anthropic(dict(original, messages=history, tools=[]), [answer])
+        self.assertEqual(count, 0)
+        self.assertEqual([message["tool_call_id"] for message in requests[0]["messages"]
+                          if message["role"] == "tool"], ["call_order", pending["id"]])
 
     def test_responses_stream_returns_function_declared_with_hosted_tool(self):
         tools = [{"type": "web_search"},
