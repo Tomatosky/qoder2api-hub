@@ -380,6 +380,17 @@ def set_auth_disabled(accounts_dir, disabled):
         save(accounts_dir, data)
 
 
+def omit_default_system_prompt(accounts_dir):
+    return load(accounts_dir).get("omit_default_system_prompt") is True
+
+
+def set_omit_default_system_prompt(accounts_dir, enabled):
+    with _lock:
+        data = load(accounts_dir)
+        data["omit_default_system_prompt"] = enabled
+        save(accounts_dir, data)
+
+
 def web_tools_enabled(accounts_dir):
     """本地 web 工具开关（面板「设置 → 本地 web 工具」）。
 
