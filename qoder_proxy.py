@@ -52,6 +52,7 @@ import qoder_accounts
 import qoder_activity
 import qoder_agents
 import qoder_anthropic
+import qoder_anthropic_web
 
 # issue #116：把宿主日志注入 anthropic 模块（它自己只 import 标准库）
 import qoder_catalog
@@ -13754,6 +13755,16 @@ class Handler(BaseHTTPRequestHandler):
         if not ok:
             return self._error(400, problem, "invalid_request_error")
         req_realm = self._request_realm()
+        web_request = None
+        if qoder_anthropic_web.applies(payload):
+            try:
+                scope = json.dumps([self._key_id_for_usage(), req_realm or ""])
+                web_request = qoder_anthropic_web.WebRequest(payload, scope, ACCOUNTS_DIR)
+                if web_request.limits and not web_tools_enabled():
+                    raise ValueError("hosted web tools are disabled")
+                payload = web_request.payload
+            except (ValueError, TypeError) as exc:
+                return self._json(400, qoder_anthropic_web.error_body(400, str(exc)))
         model_hint = payload.get("model") or "auto"
         # 与 open_upstream 同一解析器（含动态显示名兜底）：官方改显示名窗口期
         # Anthropic 首条请求才不会原样透传（meta 取不到 -> 思考档位被静默丢弃）。
@@ -13781,6 +13792,9 @@ class Handler(BaseHTTPRequestHandler):
         chat_req["_qd_structured"] = structured_tool_history_enabled(
             model=model, model_key=model_key, realm=_realm_for_shape,
             messages=chat_req.get("messages"))
+        if web_request and web_request.limits:
+            return self._handle_web_tools(path, payload, set(web_request.limits),
+                                          anthropic=(web_request, chat_req))
         holder = {"usage": None,
                   "allowed_names": _tool_names_from_payload(chat_req)}
         log("anthropic: model=%s stream=%s msgs=%d effort=%r structured=%s"
@@ -13971,9 +13985,10 @@ class Handler(BaseHTTPRequestHandler):
                          session_trace=usage_ctx)
             return self._json(200, result)
 
-    def _handle_web_tools(self, path, payload, names):
+    def _handle_web_tools(self, path, payload, names, anthropic=None):
         """Execute declared hosted web tools without client-side orchestration."""
         is_responses = path.endswith("/responses")
+        web_request, anthropic_chat = anthropic or (None, None)
         want_stream = bool(payload.get("stream"))
         names = set(names)
         # Responses web_search includes opening sources, not just a query.
@@ -13984,15 +13999,20 @@ class Handler(BaseHTTPRequestHandler):
                 declared_tools, _ = _flatten_ns_tools(_responses_tool_declarations(payload))
             else:
                 declared_tools = list(payload.get("tools") or [])
-            evidence = qoder_web_response.WebEvidence(declared_tools)
+            evidence = web_request.evidence if web_request else qoder_web_response.WebEvidence(declared_tools)
             web_config = qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True)
-            call_limit = payload.get("max_tool_calls", 8)
+            call_limit = sum(web_request.limits.values()) if web_request else payload.get("max_tool_calls", 8)
             if type(call_limit) is not int or call_limit < 0:
                 raise ValueError("max_tool_calls must be a non-negative integer")
             call_limit = min(call_limit, 32)
             if is_responses and (payload.get("previous_response_id") or payload.get("background")):
                 raise ValueError("stateful/background web responses are not supported; send full input history")
-            chat_req = (responses_to_chat(payload, hosted_web=True) if is_responses else dict(payload))
+            if web_request:
+                chat_req = anthropic_chat
+            elif is_responses:
+                chat_req = responses_to_chat(payload, hosted_web=True)
+            else:
+                chat_req = payload
             chat_req = dict(chat_req)
             original_tools = chat_req.get("tools") or []
             ordinary_names = {_tool_declared_name(t) for t in original_tools
@@ -14003,6 +14023,7 @@ class Handler(BaseHTTPRequestHandler):
             chat_req["tools"] = rewrite_web_tools(original_tools, names)
             choice = chat_req.get("tool_choice")
             choice_kind = choice.get("type") if isinstance(choice, dict) else None
+            web_disabled_by_choice = (str(choice_kind or choice or "").strip().lower() == "none")
             forced_web = (qoder_webtools.WEB_SEARCH_NAME if choice_kind in qoder_webtools.SEARCH_DECL_TYPES
                           else qoder_webtools.WEB_FETCH_NAME if choice_kind in qoder_webtools.FETCH_DECL_TYPES
                           else None)
@@ -14011,30 +14032,44 @@ class Handler(BaseHTTPRequestHandler):
             normalize_tool_choice(chat_req)
             translate_max_completion_tokens(chat_req)
         except (ValueError, TypeError) as exc:
+            if web_request:
+                return self._json(400, qoder_anthropic_web.error_body(400, str(exc)))
             return self._error(400, "invalid web request: %s" % exc, "invalid_request_error")
         chat_req["stream"] = False
         if ordinary_names and "parallel_tool_calls" not in payload:
             chat_req["parallel_tool_calls"] = False
-        self._apply_context_header(chat_req)
+        requested_tool = chat_req.get("tool_choice")
+        forced_web = requested_tool if isinstance(requested_tool, str) and requested_tool in names else None
+        if not web_request:
+            self._apply_context_header(chat_req)
         model = str(chat_req.get("model") or "")
         # issue #131-2: authorise before inference, independent of protocol/tools.
         _blocked = self._model_precheck(model, self._request_realm())
         if _blocked:
+            if web_request:
+                return self._json(400, qoder_anthropic_web.error_body(400, _blocked))
             return self._error(400, _blocked, "invalid_request_error")
         web_output = (qoder_web_response.ResponsesWebOutput(
             dict(payload, tools=declared_tools, parallel_tool_calls=chat_req["parallel_tool_calls"]),
             model, evidence, self._sse_begin if want_stream else None,
             self._sse_write if want_stream else None) if is_responses else None)
-        if web_output:
+        if is_responses:
             web_output.start()
+        elif web_request:
+            web_output = qoder_anthropic_web.WebOutput(
+                web_request, model, anthropic_thinking_mode(getattr(self, "key_entry", None)),
+                self._sse_begin if want_stream else None, self._sse_write if want_stream else None)
 
         def fail(status, message, kind="upstream_error"):
             if web_output and web_output.started:
-                web_output.fail(message)
+                web_output.fail(message, status)
                 return None
+            if web_request:
+                status = _client_error_status(status, kind)
+                return self._json(status, qoder_anthropic_web.error_body(status, message))
             return self._error(status, message, kind)
 
-        session_key = extract_session_key(self.headers, payload)
+        session_key = extract_session_key(self.headers, chat_req if web_request else payload)
         messages = list(chat_req.get("messages") or [])
         realm = self._request_realm()
         usage_ctx = {"tenant_scope": self._key_id_for_usage(), "_key_entry": getattr(self, "key_entry", None)}
@@ -14049,16 +14084,19 @@ class Handler(BaseHTTPRequestHandler):
         # the last tool results were discarded and its pending calls leaked out.
         for turn in range(round_limit + 1):
             req = dict(chat_req, messages=messages)
-            no_web = (turn >= round_limit or calls_used >= call_limit
-                      or chat_req.get("tool_choice") == "none")
+            no_web = turn >= round_limit or calls_used >= call_limit or web_disabled_by_choice
             if no_web:
-                req["tools"] = [t for t in req["tools"]
+                req["tools"] = [t for t in (req.get("tools") or [])
                                 if _tool_declared_name(t) not in names]
-                req["tool_choice"] = ("none" if chat_req.get("tool_choice") == "none"
+                req["tool_choice"] = ("none" if web_disabled_by_choice
                                       or not req["tools"] else "auto")
             elif turn:
                 # A required/forced search applies to the first turn, not forever.
                 req["tool_choice"] = "auto"
+            elif forced_web:
+                # Qoder accepts schemas but has no wire-level tool_choice. Hide
+                # other choices on the first round and verify the returned call.
+                req["tools"] = [t for t in req["tools"] if _tool_declared_name(t) == forced_web]
             try:
                 resp, account, _ = open_upstream(
                     req, target_realm=realm, usage_ctx=usage_ctx,
@@ -14066,11 +14104,18 @@ class Handler(BaseHTTPRequestHandler):
             except RateLimited as exc:
                 if web_output and web_output.started:
                     return fail(429, "upstream rate limit reached")
+                if web_request:
+                    return self._json(429, qoder_anthropic_web.error_body(429, "upstream rate limit reached"),
+                                      extra_headers={"Retry-After": max(1, int(exc.wait or 60))})
                 return self._rate_limited(exc)
             except urllib.error.HTTPError as exc:
                 detail = getattr(exc, "qoder_detail", "") or ""
                 msg, etype = friendly_upstream_error(exc.code, detail)
                 return fail(exc.code, msg, etype)
+            except UpstreamStatus as exc:
+                status = _to_int_status(exc.status)
+                msg, etype = friendly_upstream_error(status, exc.detail)
+                return fail(status, msg, etype)
             except Exception:
                 return fail(502, "upstream request failed")
             self.realm_used = usage_ctx.get("realm") or realm or ""
@@ -14117,6 +14162,9 @@ class Handler(BaseHTTPRequestHandler):
                 break
             all_calls = msg.get("tool_calls") or []
             calls = [c for c in all_calls if (c.get("function") or {}).get("name") in names]
+            if forced_web and turn == 0 and not no_web and choice.get("finish_reason") != "length":
+                if not all_calls or any((c.get("function") or {}).get("name") != forced_web for c in all_calls):
+                    return fail(502, "upstream did not call the requested hosted web tool")
             if not calls:
                 break
             if choice.get("finish_reason") == "length":
@@ -14138,15 +14186,20 @@ class Handler(BaseHTTPRequestHandler):
             messages.append(assistant)
             for call in calls:
                 fn = call.get("function") or {}
-                index = web_output.tool_start(fn.get("name"), fn.get("arguments"),
-                    executing=calls_used < call_limit) if web_output else None
+                name, arguments = fn.get("name"), fn.get("arguments")
+                error_code = ("max_uses_exceeded" if calls_used >= call_limit else
+                              web_request.unavailable(name, arguments) if web_request else None)
+                index = web_output.tool_start(name, arguments, executing=error_code is None) if web_output else None
                 observed = []
                 try:
-                    if calls_used >= call_limit:
-                        result = json.dumps({"error": "web tool budget exhausted"})
+                    if error_code:
+                        result = json.dumps({"error": error_code if web_request else "web tool budget exhausted"})
+                        observed.append({"ok": False, "error_code": error_code})
                     else:
                         calls_used += 1
-                        result = qoder_webtools.run_tool(fn.get("name"), fn.get("arguments"),
+                        if web_request:
+                            web_request.usage[name] = web_request.usage.get(name, 0) + 1
+                        result = qoder_webtools.run_tool(name, arguments,
                             account=account, context=evidence, on_result=observed.append, config=web_config)
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     raise
@@ -14171,6 +14224,9 @@ class Handler(BaseHTTPRequestHandler):
                 if citations:
                     message["annotations"] = [{"type": "url_citation", "url_citation": {
                         k: v for k, v in citation.items() if k != "type"}} for citation in citations]
+        if web_request:
+            message = web_output.finish(obj)
+            return None if want_stream else self._json(200, message)
         if is_responses:
             custom_names = custom_tool_names(declared_tools)
             tool_ns = chat_req.get("_qd_tool_ns") or {}

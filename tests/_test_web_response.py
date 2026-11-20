@@ -338,6 +338,27 @@ class HostedWebHandlerTests(unittest.TestCase):
         self.assertEqual(events[-1]["type"], "response.failed")
         self.assertNotIn("response.completed", [e["type"] for e in events])
 
+    def test_openai_responses_preserves_rate_limit_after_stream_start(self):
+        _, events, _, _ = self.run_handler([], stream=True,
+            upstream_error=urllib.error.HTTPError("https://upstream", 429, "limited", {}, io.BytesIO(b"")))
+        self.assertEqual(events[-1]["type"], "response.failed")
+        self.assertEqual(events[-1]["response"]["error"]["code"], "rate_limit_exceeded")
+
+    def test_responses_forced_hosted_tool_without_a_call_fails(self):
+        _, events, _, _ = self.run_handler([reply("Unverified answer")],
+            {"tool_choice": {"type": "web_search"}}, stream=True)
+        self.assertEqual(events[-1]["type"], "response.failed")
+        self.assertNotIn("Unverified answer", str(events))
+        self.http.assert_not_called()
+
+    def test_responses_none_stays_disabled_when_normalizer_drops_declarations(self):
+        with mock.patch.object(P, "TOOLCHOICE_NONE_DROPS_TOOLS", True):
+            (status, _), _, requests, _ = self.run_handler([reply("Done")], {"tool_choice": "none"})
+        self.assertEqual(status, 200)
+        self.assertEqual(requests[0]["tools"], [])
+        self.assertEqual(requests[0]["tool_choice"], "none")
+        self.http.assert_not_called()
+
     def test_official_tool_error_is_not_reported_as_completed_search(self):
         self.http.side_effect = TimeoutError("private-token-should-never-leak")
         _, events, _, _ = self.run_handler([reply(calls=[call()]), reply("Could not verify")], stream=True)
@@ -413,6 +434,94 @@ class HostedWebHTTPTests(unittest.TestCase):
         infer.assert_called_once()
         run_tool.assert_not_called()
         return body, infer.call_args.args[0]
+
+    def post_anthropic(self, payload, rounds, *, expected_status=200, fetched=None):
+        account = SimpleNamespace(uid="test-scope", access_token="fake-test-token", realm="cn",
+            realm_config=lambda: {"gateway": "https://gateway.qoder.com.cn", "vpc_instance": ""})
+        upstreams = []
+        for items in rounds:
+            wire = "".join("data: " + json.dumps({"body": json.dumps(item)}) + "\n\n" for item in items)
+            wire += 'data: {"body":"[DONE]"}\n\n'
+            upstreams.append((io.BytesIO(wire.encode()), account, None))
+        with mock.patch.dict(os.environ, {"QD_WEB_TOOLS": "on", "QD_WEB_TOOLS_BACKEND": "qoder"}), \
+                mock.patch.object(P, "API_KEY", "web-http-key"), \
+                mock.patch.object(P, "open_upstream", side_effect=upstreams) as infer, \
+                mock.patch.object(P, "record_usage"), mock.patch.object(W, "check_url", return_value=(True, "")), \
+                mock.patch.object(A, "http_json", return_value=fetched if fetched is not None else search_data()) as web:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            try:
+                conn.request("POST", "/v1/messages", body=json.dumps(payload), headers={
+                    "Content-Type": "application/json", "x-api-key": "web-http-key", "anthropic-version": "2023-06-01"})
+                with conn.getresponse() as resp:
+                    body = resp.read().decode()
+                    self.assertEqual(resp.status, expected_status, body)
+            finally:
+                conn.close()
+        return body, [entry.args[0] for entry in infer.call_args_list], web.call_count
+
+    @staticmethod
+    def anthropic_round(delta=None, finish="stop"):
+        return [{"choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish}]}]
+
+    def test_anthropic_web_search_stream_and_non_stream_enable_native_tool(self):
+        tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": 1}
+        payload = {"model": "test-model", "max_tokens": 100, "tools": [tool],
+                   "messages": [{"role": "user", "content": "Search for an announcement."}],
+                   "tool_choice": {"type": "tool", "name": "web_search"}}
+        rounds = [self.anthropic_round({"tool_calls": [dict(call(), index=0)]}, "tool_calls"),
+                  self.anthropic_round({"content": "See [S1]"})]
+        body, requests, count = self.post_anthropic(payload, rounds)
+        message = json.loads(body)
+        call_block, result, text = message["content"]
+        self.assertEqual(call_block["type"], "server_tool_use")
+        self.assertEqual(call_block["input"], {"query": "news"})
+        self.assertEqual(result["type"], "web_search_tool_result")
+        self.assertEqual(result["tool_use_id"], call_block["id"])
+        self.assertEqual(text["citations"][0]["url"], result["content"][0]["url"])
+        self.assertEqual(count, 1)
+        self.assertEqual(message["usage"]["server_tool_use"], {"web_search_requests": 1})
+        self.assertIn("query", requests[0]["tools"][0]["function"]["parameters"]["properties"])
+        self.assertEqual(requests[0]["tool_choice"], "web_search")
+        self.assertIn("A fact", requests[1]["messages"][-1]["content"])
+        self.assertNotIn("web_search", [d["function"]["name"] for d in requests[1]["tools"]])
+        body, _, count = self.post_anthropic(dict(payload, stream=True), rounds)
+        events = [json.loads(line[6:]) for line in body.splitlines() if line.startswith("data: ")]
+        self.assertEqual([e["index"] for e in events if e["type"] == "content_block_start"], [0, 1, 2])
+        self.assertIn("citations_delta", [e["delta"]["type"] for e in events if e["type"] == "content_block_delta"])
+        self.assertEqual(events[-2]["delta"]["stop_reason"], "end_turn")
+        self.assertEqual(events[-1]["type"], "message_stop")
+        self.assertEqual(count, 1)
+
+        replay = dict(payload, tools=[], tool_choice={"type": "auto"}, messages=payload["messages"] + [
+            {"role": "assistant", "content": message["content"]}, {"role": "user", "content": "Continue."}])
+        _, requests, count = self.post_anthropic(replay, [self.anthropic_round({"content": "Done"})])
+        history = requests[0]["messages"]
+        restored, = [row for row in history if row["role"] == "tool"]
+        self.assertEqual(restored["tool_call_id"], call_block["id"])
+        self.assertIn("A fact", restored["content"])
+        self.assertEqual(count, 0)
+        result["content"][0]["encrypted_content"] = "modified"
+        body, requests, count = self.post_anthropic(replay, [], expected_status=400)
+        self.assertEqual(json.loads(body)["error"]["type"], "invalid_request_error")
+        self.assertEqual((requests, count), ([], 0))
+
+    def test_anthropic_web_fetch_requires_url_in_context_and_returns_document(self):
+        url = "https://example.com/announcement"
+        tool = {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 1}
+        payload = {"model": "test-model", "max_tokens": 90, "tools": [tool], "messages": [
+            {"role": "user", "content": "Read " + url}]}
+        rounds = [self.anthropic_round({"tool_calls": [dict(call("web_fetch", {"url": url}), index=0)]}, "tool_calls"),
+                  self.anthropic_round({"content": "Done"})]
+        body, _, count = self.post_anthropic(payload, rounds, fetched={"results": [
+            {"statusCode": 200, "markdown": "Page contents", "metadata": {"title": "Primary source"}}]})
+        block = json.loads(body)["content"][1]
+        self.assertEqual(block["type"], "web_fetch_tool_result")
+        self.assertEqual(block["content"]["content"]["source"]["data"], "Page contents")
+        self.assertEqual(count, 1)
+        payload["messages"][0]["content"] = "Read the page."
+        body, _, count = self.post_anthropic(payload, rounds)
+        self.assertEqual(json.loads(body)["content"][1]["content"]["error_code"], "url_not_in_prior_context")
+        self.assertEqual(count, 0)
 
     def test_responses_stream_returns_function_declared_with_hosted_tool(self):
         tools = [{"type": "web_search"},
