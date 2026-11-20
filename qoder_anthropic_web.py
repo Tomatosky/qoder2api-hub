@@ -139,9 +139,10 @@ class WebRequest:
                 key = str(block.get("tool_use_id") or "")
                 if block.get("type") in _RESULT_TYPES.values() and key in awaiting:
                     origin, call = awaiting[key]
-                    if origin < i:
-                        paired.append(call)
-                        awaiting.pop(key)
+                    if origin >= i or block["type"] != _RESULT_TYPES.get(str(call.get("name") or "")):
+                        raise ValueError("invalid result for a pending web tool")
+                    paired.append(call)
+                    awaiting.pop(key)
             if paired:
                 edited[i] = paired + blocks
         for i, blocks in edited.items():
@@ -250,13 +251,11 @@ class WebRequest:
                 converted.append(dict(message, content=pending))
         return converted
 
-    def unavailable(self, name, arguments):
+    def unavailable(self, name, params):
         if self.used_before.get(name, 0) + self.usage.get(name, 0) >= self.limits[name]:
             return "max_uses_exceeded"
-        params = parse_arguments(arguments)
         if name == "web_search":
-            query = params.get("query")
-            return None if isinstance(query, str) and query.strip() else "invalid_tool_input"
+            return None
         url = params.get("url")
         if not public_link(url):
             return "invalid_tool_input"

@@ -3642,7 +3642,7 @@ def clean_chunk(raw):
             continue
         fc = delta.get("function_call")
         if fc is not None:
-            fc_empty = (not fc) if not isinstance(fc, dict) else (not fc.get("name"))
+            fc_empty = (not fc) if not isinstance(fc, dict) else not (fc.get("name") or fc.get("arguments"))
             if fc_empty:
                 delta.pop("function_call", None)
                 changed = True
@@ -3663,7 +3663,7 @@ def _strip_empty_fc(obj):
     changed = False
     if isinstance(obj, dict):
         fc = obj.get("function_call")
-        if isinstance(fc, dict) and not fc.get("name"):
+        if isinstance(fc, dict) and not (fc.get("name") or fc.get("arguments")):
             obj.pop("function_call", None)
             changed = True
         tc = obj.get("tool_calls")
@@ -9975,6 +9975,14 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None,
                 holder["usage"] = usage
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
+            reason = choice.get("finish_reason")
+            if require_terminal and reason == "function_call":
+                reason = "tool_calls"
+            if require_terminal and finish is not None:
+                if (reason and reason != finish) or any(delta.get(field) for field in (
+                        "content", "reasoning_content", "tool_calls", "function_call")):
+                    raise UpstreamStatus(502, "upstream sent additional output after a terminal chunk")
+                continue
             if delta.get("content"):
                 _c = delta["content"]
                 if isinstance(_c, str):
@@ -10013,7 +10021,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None,
                         entry["function"]["arguments"] = \
                             (entry["function"]["arguments"] or "") + fn_args
             fc = delta.get("function_call")
-            if fc and isinstance(fc, dict) and fc.get("name"):
+            if isinstance(fc, dict) and (fc.get("name") or fc.get("arguments")):
                 idx = 0
                 if idx not in tool_calls_map:
                     tool_calls_map[idx] = {
@@ -10028,8 +10036,8 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None,
                         entry["function"]["name"] = fc["name"]
                     if fc.get("arguments"):
                         entry["function"]["arguments"] += fc["arguments"]
-            if choice.get("finish_reason"):
-                finish = choice["finish_reason"]
+            if reason:
+                finish = reason
 
     if require_terminal and finish not in ("stop", "tool_calls", "function_call",
                                            "length", "content_filter"):
@@ -10155,21 +10163,30 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None,
     if not tool_calls_map:
         _raise_unstructured_tool_echo(message.get("content") or "", allowed_names)
     # Never erase native calls into successful empty completion.
-    if any(not (v.get("function") or {}).get("name") for v in tool_calls_map.values()):
-        raise EmptyToolEcho(0, "missing_tool_name")
-    for entry in tool_calls_map.values():
-        args = (entry.get("function") or {}).get("arguments") or ""
-        if args.strip():
+    if require_terminal and finish == "content_filter":
+        tool_calls_map.clear()
+    for index, entry in list(tool_calls_map.items()):
+        function = entry.get("function") or {}
+        args = function.get("arguments") or ""
+        fault = "missing_tool_name" if not function.get("name") else None
+        if args.strip() and not fault:
             try:
                 json.loads(args)
             except (ValueError, TypeError):
-                raise EmptyToolEcho(len(args), "truncated_arguments")
+                fault = "truncated_arguments"
+        if fault:
+            if require_terminal and finish == "length":
+                # A truncated call is not executable. Retain the actual length
+                # terminal and any other calls with complete inputs.
+                del tool_calls_map[index]
+            else:
+                raise EmptyToolEcho(len(args), fault)
     if tool_calls_map:
         ordered = [tool_calls_map[k] for k in sorted(tool_calls_map.keys())]
         message["tool_calls"] = ordered
-        if finish in ("stop", None):
+        if finish in ("stop", "function_call", None):
             finish = "tool_calls"
-    elif finish == "tool_calls":
+    elif finish in ("tool_calls", "function_call"):
         raise EmptyToolEcho(0, "missing_tool_call")
     if (allowed_names and not tool_calls_map and not message.get("content", "").strip()
             and finish not in ("length", "content_filter")):
@@ -11552,11 +11569,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, code, message, err_type="server_error", retry_after=None):
+    def _error(self, code, message, err_type="server_error", retry_after=None, *, close_connection=False):
         code = _client_error_status(code, err_type)   # issue #137
-        extra = {"Retry-After": int(retry_after)} if retry_after else None
+        extra = {"Retry-After": int(retry_after)} if retry_after else {}
+        if close_connection:
+            extra["Connection"] = "close"
         self._json(code, {"error": {"message": message, "type": err_type,
-                                    "code": code}}, extra_headers=extra)
+                                    "code": code}}, extra_headers=extra or None)
 
     def _unknown_path_error(self, path):
         """404，并针对最常见的「接入地址填错」给出可执行提示。
@@ -11761,7 +11780,12 @@ class Handler(BaseHTTPRequestHandler):
         if self._key_ok():
             _CLIENT_CTX.key_entry = getattr(self, "key_entry", None)
             return True
-        self._error(401, "invalid api key", "invalid_request_error")
+        if getattr(self, "command", None) == "POST":
+            # The request body has not been consumed. Do not parse it as the
+            # next request line on a persistent connection.
+            self._error(401, "invalid api key", "invalid_request_error", close_connection=True)
+        else:
+            self._error(401, "invalid api key", "invalid_request_error")
         return False
 
     # ---- web panel access ----
@@ -14085,7 +14109,16 @@ class Handler(BaseHTTPRequestHandler):
         def web_error(name, arguments):
             if calls_used >= call_limit:
                 return "max_uses_exceeded"
-            return web_request.unavailable(name, arguments) if web_request else None
+            params = qoder_web_response.parse_arguments(arguments)
+            if name == qoder_webtools.WEB_SEARCH_NAME:
+                query = params.get("query")
+                if not isinstance(query, str) or not query.strip():
+                    return "invalid_tool_input"
+            else:
+                url = params.get("url")
+                if not isinstance(url, str) or not url.strip():
+                    return "invalid_tool_input"
+            return web_request.unavailable(name, params) if web_request else None
 
         def count_web(name):
             nonlocal calls_used
@@ -14095,18 +14128,17 @@ class Handler(BaseHTTPRequestHandler):
 
         def execute_web(name, arguments, account, error):
             if error:
-                return (json.dumps({"error": error if web_request else "web tool budget exhausted"}),
+                message = "web tool budget exhausted" if not web_request and error == "max_uses_exceeded" else error
+                return (json.dumps({"error": message}),
                         {"ok": False, "error_code": error})
             count_web(name)
             observed = []
             try:
                 result = qoder_webtools.run_tool(name, arguments, account=account,
                     context=evidence, on_result=observed.append, config=web_config)
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-                raise
-            except (ValueError, TypeError) as exc:
-                result = json.dumps({"error": str(exc)[:200]}, ensure_ascii=False)
             except Exception:
+                # Response writes happen in the caller. A socket failure here
+                # belongs to the tool backend, not the client's HTTP connection.
                 result = json.dumps({"error": "web tool execution failed"})
             return result, observed[-1] if observed else {"ok": False}
 
@@ -14241,6 +14273,13 @@ class Handler(BaseHTTPRequestHandler):
                 msg.pop("tool_calls", None)
                 break
             all_calls = msg.get("tool_calls") or []
+            declared_calls = [call for call in all_calls
+                              if (call.get("function") or {}).get("name") in all_names]
+            if len(declared_calls) != len(all_calls):
+                if choice.get("finish_reason") != "length":
+                    return fail(502, "upstream returned an undeclared tool call")
+                all_calls = declared_calls
+                msg["tool_calls"] = all_calls
             calls = [c for c in all_calls if (c.get("function") or {}).get("name") in names]
             if forced_web and turn == 0 and not no_web and choice.get("finish_reason") != "length":
                 if not all_calls or any((c.get("function") or {}).get("name") != forced_web for c in all_calls):
