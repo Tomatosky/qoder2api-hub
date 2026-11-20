@@ -9105,6 +9105,8 @@ def web_tools_settings_view():
     return {"web_tools_backend": backend_env or config["backend"],
             "web_tools_backend_env": backend_env,
             "web_tools_enabled_env": (os.environ.get("QD_WEB_TOOLS") or "").strip().lower(),
+            "web_fetch_backend": config["fetch_backend"],
+            "web_fetch_external": qoder_external_web.public_profile(config["external_fetch"]),
             "web_tools_external": qoder_external_web.public_profile(config["external"]),
             "web_tools_external_profiles": {name: qoder_external_web.public_profile(profile)
                 for name, profile in config["external_profiles"].items()}}
@@ -14061,10 +14063,17 @@ class Handler(BaseHTTPRequestHandler):
             choice = chat_req.get("tool_choice")
             choice_kind = choice.get("type") if isinstance(choice, dict) else None
             web_disabled_by_choice = (str(choice_kind or choice or "").strip().lower() == "none")
-            web_config = (None if web_request and web_disabled_by_choice
-                          else qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True))
             anthropic_forced = (choice["function"]["name"]
                                 if web_request and choice_kind == "function" else None)
+            ready_names = names
+            if web_request:
+                ready_names = {name for name, uses in web_request.limits.items() if uses > 0}
+                # A named client tool stops the request. A named web tool can
+                # still be followed by other hosted tools on later rounds.
+                if anthropic_forced and anthropic_forced not in names and not web_request.resume:
+                    ready_names.clear()
+            web_config = (None if web_request and web_disabled_by_choice
+                          else qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True, names=ready_names))
             forced_web = (qoder_webtools.WEB_SEARCH_NAME if choice_kind in qoder_webtools.SEARCH_DECL_TYPES
                           else qoder_webtools.WEB_FETCH_NAME if choice_kind in qoder_webtools.FETCH_DECL_TYPES
                           else None)
