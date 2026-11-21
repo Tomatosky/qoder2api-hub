@@ -386,7 +386,15 @@ def omit_default_system_prompt(accounts_dir):
 
 def set_omit_default_system_prompt(accounts_dir, enabled):
     with _lock:
-        data = load(accounts_dir)
+        try:
+            with open(settings_path(accounts_dir), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            data = {}
+        except (ValueError, UnicodeError) as exc:
+            raise OSError("settings.json is invalid; refusing to overwrite it") from exc
+        if not isinstance(data, dict):
+            raise OSError("settings.json must contain an object; refusing to overwrite it")
         data["omit_default_system_prompt"] = enabled
         save(accounts_dir, data)
 

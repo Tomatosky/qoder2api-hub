@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 23
+    "version": 24
   },
   "messages": {
     "国内版服务入口": "China service endpoint",

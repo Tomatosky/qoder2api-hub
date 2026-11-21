@@ -130,4 +130,31 @@ with tempfile.TemporaryDirectory() as directory:
             server.server_close()
             worker.join(3)
 
+with tempfile.TemporaryDirectory() as directory:
+    from pathlib import Path
+    import builtins
+    settings = Path(directory) / "settings.json"
+    saved = '{"api_keys": [{"key": "fixture-only"}], "unknown": [1, 2]}'
+    settings.write_text(saved, encoding="utf-8")
+    with mock.patch.object(builtins, "open", side_effect=PermissionError("fixture read failure")):
+        try:
+            P.qoder_settings.set_omit_default_system_prompt(directory, True)
+        except PermissionError:
+            check("unreadable settings reject the write", True)
+        else:
+            check("unreadable settings reject the write", False)
+    check("read failure leaves unrelated config byte-for-byte intact",
+          settings.read_text(encoding="utf-8") == saved)
+    for raw in ("{unfinished", "[1, 2]"):
+        settings.write_text(raw, encoding="utf-8")
+        try:
+            P.qoder_settings.set_omit_default_system_prompt(directory, True)
+        except OSError:
+            check("corrupt or non-object settings remain intact", settings.read_text(encoding="utf-8") == raw)
+        else:
+            check("corrupt or non-object settings reject the write", False)
+    settings.write_text(saved, encoding="utf-8")
+    P.qoder_settings.set_omit_default_system_prompt(directory, True)
+    check("healthy settings preserve unrelated fields", P.qoder_settings.load(directory)
+          == dict(json.loads(saved), omit_default_system_prompt=True))
 finish()

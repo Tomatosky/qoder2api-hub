@@ -32,7 +32,7 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 
 ## 系统提示词
 
-客户端提供的系统提示词优先，其次是启动参数 `--system-prompt`。两者都没有时，网关默认发送 Qoder 模板自带的提示词。
+非空的客户端系统提示词优先，其次是非空启动参数 `--system-prompt`；空字符串不覆盖下一级。两者都没有时，网关默认发送 Qoder 模板自带的提示词。显式传入 `--system-prompt "You are a helpful assistant."` 时，这段文字作为自定义值发送。
 
 在「设置 → 系统提示词」勾选「清空 Qoder 默认提示词」并保存。没有自定义提示词的新请求将省略 Qoder 的默认提示词。Kimi 调用工具时仍会收到网关的工具协议指令。
 

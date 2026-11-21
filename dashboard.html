@@ -8187,15 +8187,22 @@ async function saveModelContext(model, label){
   }catch(e){ toast('保存失败: ' + e.message, 'bad'); }
 }
 
+let SYSTEM_PROMPT_READ_ID = 0;
+let SYSTEM_PROMPT_SAVING = false;
+let SYSTEM_PROMPT_CONFIRMED = null;
+
 async function loadSettings(showToast){
+  const promptReadId = ++SYSTEM_PROMPT_READ_ID;
   try {
     const data = await getJSON('/settings');
     // issue #106：模型上下文档缓存给模型库表用（保存后也走这份）
     window.SETTINGS_MODEL_CONTEXT = data.model_context || {};
     renderWebToolsSettings(data);
     const promptForm = document.getElementById('setSystemPromptForm');
-    if(promptForm && typeof data.omit_default_system_prompt === 'boolean'){
-      document.getElementById('setOmitDefaultSystemPrompt').checked = data.omit_default_system_prompt;
+    if(promptForm && !SYSTEM_PROMPT_SAVING && promptReadId === SYSTEM_PROMPT_READ_ID
+        && typeof data.omit_default_system_prompt === 'boolean'){
+      SYSTEM_PROMPT_CONFIRMED = data.omit_default_system_prompt;
+      document.getElementById('setOmitDefaultSystemPrompt').checked = SYSTEM_PROMPT_CONFIRMED;
       promptForm.disabled = false;
     }
     // issue #135：工具协议残片收尾策略回显（环境变量优先时给出提示）
@@ -8256,15 +8263,23 @@ async function loadSettings(showToast){
 async function saveSystemPromptSettings(){
   const form = document.getElementById('setSystemPromptForm');
   const checkbox = document.getElementById('setOmitDefaultSystemPrompt');
+  if(!form || !checkbox || form.disabled || SYSTEM_PROMPT_SAVING) return;
+  SYSTEM_PROMPT_SAVING = true;
+  ++SYSTEM_PROMPT_READ_ID;
   const omit = checkbox.checked;
   form.disabled = true;
   try{
     const result = await postJSON('/settings/save', {omit_default_system_prompt: omit});
     if(result.omit_default_system_prompt !== omit) throw new Error(t('未确认系统提示词设置'));
+    SYSTEM_PROMPT_CONFIRMED = result.omit_default_system_prompt;
+    checkbox.checked = SYSTEM_PROMPT_CONFIRMED;
     toast('系统提示词设置已保存', 'ok');
   }catch(e){
+    if(SYSTEM_PROMPT_CONFIRMED !== null) checkbox.checked = SYSTEM_PROMPT_CONFIRMED;
     toast('保存失败: ' + e.message, 'bad');
   }finally{
+    ++SYSTEM_PROMPT_READ_ID;
+    SYSTEM_PROMPT_SAVING = false;
     form.disabled = false;
   }
 }
