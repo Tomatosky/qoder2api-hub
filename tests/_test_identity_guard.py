@@ -62,6 +62,9 @@ CASES_MISS = [
     "powered by the DeepSeek Harness.",  # 小写 the 阻断
     "powered by deepseek harness.",      # 小写品牌
     "DeepSeek Harness",                  # 裸词
+    # 自家品牌豁免：上游不拦截 Qoder，默认系统提示词须零改动（保缓存前缀）
+    "You are Qoder, an interactive CLI tool that helps users.",
+    "powered by Qoder.",
     "",
 ]
 for src in CASES_MISS:
@@ -129,6 +132,28 @@ try:
           and "You are ZCode," not in sys_text2, sys_text2[:80])
     check("user message intact", any(m.get("content") == "reply ok"
                                      for m in body_on["messages"]))
+finally:
+    os.environ.pop("QD_IDENTITY_GUARD", None)
+
+# ---- 6. 缓存前缀保护：默认系统提示词（自家品牌）守卫开启也零改动 ----
+# 普通请求不带第三方品牌句时，出站 system 必须与官方逐字节一致，
+# 否则每个请求的前缀都偏离官方、部署/切换时一次性失效全部缓存。
+default_sys = next((m["content"] for m in P.BASEPROMPT.get("messages", [])
+                    if m.get("role") == "system"), "")
+check("baseprompt has Qoder identity", default_sys.startswith("You are Qoder,"),
+      default_sys[:60])
+out_default, n_default = G.neutralize_text(default_sys)
+check("default system untouched (own brand)", out_default is default_sys and n_default == 0)
+os.environ["QD_IDENTITY_GUARD"] = "1"
+try:
+    # 无客户端 system → hub 注入默认提示词；守卫开启不得改动它
+    body_plain = P.build_qoder_body(
+        {"model": "efficient", "messages": [{"role": "user", "content": "hi"}]},
+        _Acct(), "efficient", realm="intl")
+    plain_sys = next((m["content"] for m in body_plain["messages"]
+                      if m.get("role") == "system"), "")
+    check("guard on keeps default system byte-identical",
+          plain_sys == default_sys, plain_sys[:60])
 finally:
     os.environ.pop("QD_IDENTITY_GUARD", None)
 

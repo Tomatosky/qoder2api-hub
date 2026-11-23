@@ -33,7 +33,9 @@ serviceAvailable=false、retryAfterSeconds=30）。该信封是**硬拒绝**而�
 （Claude Code / DeepSeek-Harness / GPT-5）。小写词（a / an / the /
 my …）天然不匹配，因此 "You are a helpful assistant," 这类普通句子
 零改动。未知品牌（如 XCode）同样被中和——多插一个空格语义无损，
-宁可宽覆盖也不漏掉上游新增的检测项。
+宁可宽覆盖也不漏掉上游新增的检测项。**自家品牌 Qoder 豁免**：上游不
+拦截 Qoder 自己的身份句，而 hub 默认系统提示词正是 "You are Qoder, …"；
+豁免后无第三方品牌的普通请求零改动，缓存前缀与官方逐字节一致。
 
 开关（默认关闭，显式开启才改写）：
   - 环境变量 QD_IDENTITY_GUARD=1/on/true/yes
@@ -55,6 +57,14 @@ _BRAND = r"[A-Z][A-Za-z0-9]*(?:[ -][A-Z0-9][A-Za-z0-9]*)*"
 # 中和后（标点前已有空格）不再命中 —— 天然幂等。
 _IDENTITY_RE = re.compile(r"You are (" + _BRAND + r"),")
 _POWERED_RE = re.compile(r"powered by (" + _BRAND + r")\.")
+
+# 自家品牌豁免：上游不拦截 Qoder 自己的身份句（实测 "You are Qoder," 正常
+# 放行），而 hub 默认系统提示词正是 "You are Qoder, an interactive CLI tool…"。
+# 若一并中和，会让**每个普通请求**的前缀偏离官方字节 —— 虽不破坏 hub 内部
+# 缓存（中和确定性、前缀稳定），但部署/开关切换时一次性失效全部已缓存前缀，
+# 且与官方客户端不再共享同一前缀。豁免自家品牌后，无第三方品牌的请求零改动，
+# 缓存前缀与官方逐字节一致。
+OWN_BRANDS = frozenset({"Qoder"})
 
 
 def guard_enabled(accounts_dir=None):
@@ -87,18 +97,26 @@ def neutralize_text(text):
 
     def _identity(m):
         nonlocal hits
+        if m.group(1) in OWN_BRANDS:
+            return m.group(0)          # 自家品牌豁免，零改动
         hits += 1
         # "You are ZCode," -> "You are ZCode ,"（逗号前插空格）
         return m.group(0)[:-1] + " ,"
 
     def _powered(m):
         nonlocal hits
+        if m.group(1) in OWN_BRANDS:
+            return m.group(0)          # 自家品牌豁免，零改动
         hits += 1
         # "powered by DeepSeek Harness." -> "powered by DeepSeek Harness ."
         return m.group(0)[:-1] + " ."
 
     out = _IDENTITY_RE.sub(_identity, text)
     out = _POWERED_RE.sub(_powered, out)
+    # 零命中（含自家品牌豁免：sub 会重建对象但内容不变）时返回原对象，
+    # 保证「无改动 = 同一对象」语义，调用方可据此跳过复制、缓存前缀逐字节不变。
+    if not hits:
+        return text, 0
     return out, hits
 
 
