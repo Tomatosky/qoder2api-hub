@@ -74,3 +74,75 @@ Retry-After       -> 等待建议 + 有限预算，到限停止
 官方客户端对照     -> 同账号 / 同时间窗口 / 同模型 / 同区域
 根因确认           -> 官方支持，不由标签或网络类型推定
 ```
+
+## 7. 2026-11-23 受控 A/B 实验：品牌身份句触发 p1 硬拒绝（已定位）
+
+> 本节是**受控实验结论**，不是猜测：同账号、同出口 IP、同模型、同请求形态，
+> 仅改 system 一句话做单变量对照，每形态多次复测。实验脚本见
+> `test-hub/direct_probe.py`（本地临时目录，不入库）。
+
+### 7.1 现象与定位
+
+部分第三方 Agent 客户端（ZCode / DSH / Claude Code / Codex 等）经网关请求
+`efficient` 等模型时持续收到 `10605 / queueType:p1 / queueCount:0 /
+retryAfterSeconds:30 / serviceAvailable:false`；按 retryAfterSeconds 等待
+重试仍被拒（单请求可拖到 180s+ 后 502）。官方 Qoder 客户端与不含特征句的
+请求（如 WorkBuddy 渠道）同时刻正常。
+
+单变量对照排除了：出口 IP（本机与网关同出口）、账号（同一 teams 账号）、
+机器身份头（cosy-machineid/token/type 换真实值无效）、cosy-clientip、
+工具定义（通用 tools 不触发）、模型（efficient/qmodel_38max/gmodel/
+kmodel_latest 全命中，网关层前置拦截）。
+
+**触发条件是出站 messages 文本中的字面子串（大小写敏感）：**
+
+| 形态 | 示例 | 结果 |
+|---|---|---|
+| A 身份同位语 | `You are ZCode,` / `You are Claude Code,` / `You are Codex,` | 命中（逗号必须紧跟品牌名） |
+| B powered 归属 | `powered by DeepSeek Harness.` | 命中（句号必须紧跟品牌名） |
+| 逗号前有空格 | `You are ZCode ,` | 不命中 |
+| 无逗号/换行/分号 | `You are ZCode.` / `You are ZCode\n...` | 不命中 |
+| 大小写不同 | `You are zcode,` / `You are ZCODE,` | 不命中 |
+| 未知品牌 | `You are FooBar,` / `You are XCode,` | 不命中 |
+| 加冠词/连字符 | `powered by the DeepSeek Harness.` / `DeepSeek-Harness.` | 不命中 |
+| 裸品牌词 | `ZCode` / `DeepSeek Harness` 单独出现 | 不命中 |
+| user 消息含品牌 | `I am using DeepSeek Harness` | 不命中（实验样本内） |
+
+命中响应极快（0.2-0.5s，远快于正常推理），且 `serviceAvailable:false`、
+`queueCount:0`——是**硬拒绝伪装成排队**，不是容量不足，等待不会放行。
+
+### 7.2 对策：出站身份句守卫（qoder_identity_guard.py）
+
+最小字符级中和：只在命中片段内插入一个空格（逗号前 / 句号前），打断字面
+匹配；品牌名、语序、语义全部保留，模型自我认知与工具指令不受影响。
+处理范围覆盖 system + 全部历史消息文本 part + reasoning_content。
+
+**品牌匹配用通用正则而非固定名单**（上游随时增补品牌，名单追不上）：
+
+```
+品牌名 = [A-Z][A-Za-z0-9]*(?:[ -][A-Z0-9][A-Za-z0-9]*)*
+模式 A = You are (品牌名),        → 逗号前插空格
+模式 B = powered by (品牌名).     → 句号前插空格
+```
+
+- 大写开头、允许多词/连字符/数字尾词（Claude Code / DeepSeek-Harness / GPT-5）
+- 小写词（a / an / the / my …）天然不匹配 → `You are a helpful assistant,` 零改动
+- 未知品牌（XCode 等）同样中和：多插一个空格语义无损，宁宽覆盖不漏检
+- 中和产物（标点前已有空格）不再命中 → **天然幂等**
+
+开关与验证：
+
+- 开关：`QD_IDENTITY_GUARD=1` 或面板「设置 → 出站身份句守卫」，**默认关闭**
+- 实测：开启后 ZCode / DSH / Claude Code / Codex / 未知品牌身份句经 OpenAI 与
+  Anthropic 两入口均秒过；普通句子零改动；关闭时同请求复现 184s 排队后 502
+- 守护测试：`tests/_test_identity_guard.py`（57 断言，含幂等与误伤边界）
+
+### 7.3 边界与未决
+
+- 通用正则覆盖「大写品牌名 + 紧跟逗号/句号」这一已确认形态。若上游新增
+  其它句式（如不同前缀、不同标点），需按同口径补正则；XCode 客户端报告
+  失败但其 `You are XCode,` 变体当日未命中上游检测，真实触发句待抓包确认
+  （通用正则已能中和其大写身份句，属预防性覆盖）。
+- 本对策只做**字符级最小中和**，不做语义改写；若上游升级为语义识别，
+  需要重新评估。
+- 排队信封的其余形态（p3/p4 等）仍按第 1-6 节口径处理，根因 unknown。

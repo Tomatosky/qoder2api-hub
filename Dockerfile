@@ -47,6 +47,7 @@ COPY qoder_proxy.py qoder_accounts.py qoder_catalog.py qoder_fingerprint.py \
      qoder_anthropic.py qoder_anthropic_web.py qoder_agents.py qoder_updater.py \
      qoder_pricing.py qoder_activity.py qoder_webtools.py qoder_official_web.py qoder_web_response.py qoder_external_web.py qoder_session_cache.py \
      qoder_keepalive.py qoder_images.py qoder_cache.py qoder_admin.py qoder_routing.py qoder_logpaths.py \
+     qoder_identity_guard.py \
      dashboard.html baseprompt.json ./
 
 # 官方模型目录快照（运行时优先读取；缺失会回退 qoder_catalog.py 内嵌冻结副本）
