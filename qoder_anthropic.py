@@ -77,6 +77,29 @@ def thinking_mode(override=None):
     raw = (os.environ.get("QD_ANTHROPIC_THINKING") or "").strip().lower()
     return raw if raw in ("empty",) else "off"
 
+
+def wants_thinking(payload):
+    """客户端是否显式要求思考（用于决定是否输出空签名 thinking block）。
+
+    Claude Code 对第三方模型名发 `thinking={"type":"adaptive"}` +
+    `output_config={"effort":...}`；原生 Anthropic 客户端发
+    `thinking={"type":"enabled","budget_tokens":...}`。两者都算「要求思考」；
+    `thinking.type=="disabled"` 或完全没给思考参数则不算。
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    th = payload.get("thinking")
+    if isinstance(th, dict):
+        kind = str(th.get("type") or "").strip().lower()
+        if kind == "disabled":
+            return False
+        if kind in ("enabled", "adaptive"):
+            return True
+        if th.get("budget_tokens") is not None or th.get("effort") \
+                or th.get("level"):
+            return True
+    oc = payload.get("output_config")
+    return isinstance(oc, dict) and bool(oc.get("effort"))
+
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
@@ -544,12 +567,13 @@ def chat_to_messages(chat_obj, model=None, thinking_mode_override=None):
     if isinstance(text, list):
         text = "".join(p.get("text", "") for p in text
                        if isinstance(p, dict))
-    if isinstance(text, str) and text:
-        content.append({"type": "text", "text": text})
+    # Anthropic 要求 thinking block 在正文之前（客户端按顺序渲染/回传）。
     if thinking_mode(thinking_mode_override) == "empty" and msg.get("reasoning_content"):
         content.append({"type": "thinking",
                         "thinking": str(msg["reasoning_content"]),
                         "signature": ""})
+    if isinstance(text, str) and text:
+        content.append({"type": "text", "text": text})
     for tc in msg.get("tool_calls") or []:
         if not isinstance(tc, dict):
             continue

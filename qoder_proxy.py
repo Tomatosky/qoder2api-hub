@@ -8186,10 +8186,15 @@ def tool_echo_mode():
     return val if val in ("strict", "lenient") else TOOL_ECHO_MODE
 
 
-def anthropic_thinking_mode(key_entry=None):
+def anthropic_thinking_mode(key_entry=None, payload=None):
     """Anthropic 入口 thinking block 输出策略（issue #146）：empty | off。
 
-    优先级：1) 每 Key 覆盖  2) 面板全局设置  3) 环境变量 QD_ANTHROPIC_THINKING  4) off。
+    优先级：1) 每 Key 覆盖  2) 面板全局设置  3) 环境变量 QD_ANTHROPIC_THINKING
+    4) 请求显式要求思考 -> empty  5) off。
+
+    第 4 条是「请求驱动」：客户端带了 thinking:enabled/adaptive 或
+    output_config.effort 时，按它的意图输出空签名 thinking block；显式
+    off（Key/面板/环境变量）仍然优先，便于强制关闭。
     """
     if isinstance(key_entry, dict):
         key_mode = str(key_entry.get("anthropic_thinking") or "").strip().lower()
@@ -8202,7 +8207,12 @@ def anthropic_thinking_mode(key_entry=None):
     if panel_mode in ("empty", "off"):
         return panel_mode
     env_mode = (os.environ.get("QD_ANTHROPIC_THINKING") or "").strip().lower()
-    return env_mode if env_mode in ("empty",) else "off"
+    if env_mode in ("empty", "off"):
+        return env_mode
+    if payload is not None and qoder_anthropic.wants_thinking(payload):
+        return "empty"
+    return "off"
+
 
 def _neutralize_auth_codes(text):
     """把文字里独立出现的 401/403 改写成 HTTP_401/HTTP_403（issue #137）。"""
@@ -13809,6 +13819,10 @@ class Handler(BaseHTTPRequestHandler):
         model_key = resolve_model_key(model_hint, realm=req_realm)
         # 传 supported 档位表，否则 effort_from_anthropic 会静默丢弃思考档位。
         meta = catalog_meta_for(model_key, req_realm)
+        # issue #146 的「请求驱动」：客户端显式要思考才输出（空签名）thinking；同一请
+        # 求的流式/非流式必须用同一个决策，避免两条出口行为分叉。
+        thinking_mode = anthropic_thinking_mode(
+            getattr(self, "key_entry", None), payload)
         chat_req = qoder_anthropic.messages_to_chat(
             payload, catalog_meta=meta, supported=supported_efforts(meta))
         self._apply_context_header(chat_req)  # issue #106
@@ -13949,7 +13963,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._sse_write)
                     for frame in qoder_anthropic.stream_anthropic_events(
                             inner, model, holder,
-                            thinking_mode_override=anthropic_thinking_mode(getattr(self, "key_entry", None))):
+                            thinking_mode_override=thinking_mode):
                         if first_ms is None:
                             first_ms = int((time.time() - t_start) * 1000)
                         self._sse_write(frame)
@@ -14012,8 +14026,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             result = qoder_anthropic.chat_to_messages(
-                chat_obj, model=model,
-                thinking_mode_override=anthropic_thinking_mode(getattr(self, "key_entry", None)))
+                chat_obj, model=model, thinking_mode_override=thinking_mode)
             record_usage(model, chat_obj.get("usage"), stream=False,
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
