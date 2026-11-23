@@ -547,7 +547,7 @@ def chat_usage_to_anthropic(usage):
         "cache_creation_input_tokens": 0,
         "output_tokens": max(0, _int(u.get("completion_tokens"))),
         "output_tokens_details": {
-            "reasoning_tokens": max(0, _int(details.get("reasoning_tokens")))},
+            "thinking_tokens": max(0, _int(details.get("reasoning_tokens")))},
     }
 
 

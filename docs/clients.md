@@ -88,7 +88,7 @@ export ANTHROPIC_MODEL="Qwen3.8-Max"
 
 搜索结果可随会话历史回传。重启网关后继续使用原历史，需保留网关设置和同一个 API Key、区域。
 
-thinking block 的输出顺序与原生 API 一致：**thinking 在 text 之前**（非流式 `content[]` 与流式 `content_block_start` 同序）。DeepSeek-Flash `thinking:enabled` 实测非流式返回 `['thinking','text']`、流式先发 `thinking` 的 `content_block_start`，reasoning 用量在 `usage.output_tokens_details.reasoning_tokens`。
+thinking block 的输出顺序与原生 API 一致：**thinking 在 text 之前**（非流式 `content[]` 与流式 `content_block_start` 同序）。DeepSeek-Flash `thinking:enabled` 实测非流式返回 `['thinking','text']`、流式先发 `thinking` 的 `content_block_start`，reasoning 用量在 `usage.output_tokens_details.thinking_tokens`。
 
 `messages` 里的 system 消息默认会原位改成 user 消息，让顶层 system 每一轮都保持不变，从而保证前缀缓存的命中率（`QD_ANTHROPIC_MSG_SYSTEM`）。
 
