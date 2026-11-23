@@ -14238,6 +14238,15 @@ class Handler(BaseHTTPRequestHandler):
             elif not first:
                 # A required/forced search applies to the first turn, not forever.
                 req["tool_choice"] = "auto"
+            if web_request and not web_disabled_by_choice:
+                used = web_request.used_before
+                current = web_request.usage
+                req["tools"] = [t for t in (req.get("tools") or [])
+                                if _tool_declared_name(t) not in names or
+                                used.get(_tool_declared_name(t), 0) + current.get(_tool_declared_name(t), 0)
+                                < web_request.limits[_tool_declared_name(t)]]
+            round_names = ({_tool_declared_name(t) for t in (req.get("tools") or [])}
+                           if web_request else all_names)
             if first and forced_tool and (web_request or not no_web):
                 # Qoder accepts schemas but has no wire-level tool_choice. Hide
                 # other choices on the first round and verify the returned call.
@@ -14276,7 +14285,7 @@ class Handler(BaseHTTPRequestHandler):
                 with resp:
                     obj = aggregate_stream(resp, model, holder={
                         "usage": None, "_hosted_web_fail_on_inner_error": True},
-                        allowed_names=all_names, require_terminal=True)
+                        allowed_names=round_names, require_terminal=True)
             except Exception:
                 # This block only consumes the upstream body. Socket errors
                 # here are source failures. Client write errors propagate.
@@ -14310,6 +14319,10 @@ class Handler(BaseHTTPRequestHandler):
             choice = (obj.get("choices") or [{}])[0]
             msg = choice.get("message") or {}
             if web_request:
+                reported_output = _u.get("completion_tokens")
+                if reported_output is not None and (type(reported_output) is not int
+                                                     or not 0 <= reported_output <= tokens_left):
+                    return fail(502, "upstream output usage is outside the remaining token budget")
                 tokens_left -= qoder_anthropic_web.completion_tokens(_u, msg)
             if choice.get("finish_reason") == "content_filter":
                 msg.pop("tool_calls", None)
@@ -14320,7 +14333,7 @@ class Handler(BaseHTTPRequestHandler):
             if disable_parallel and len(all_calls) > 1:
                 return fail(502, "upstream returned parallel tool calls with parallel tool use disabled")
             declared_calls = [call for call in all_calls
-                              if (call.get("function") or {}).get("name") in all_names]
+                              if (call.get("function") or {}).get("name") in round_names]
             if len(declared_calls) != len(all_calls):
                 if choice.get("finish_reason") != "length":
                     return fail(502, "upstream returned an undeclared tool call")

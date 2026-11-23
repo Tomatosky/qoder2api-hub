@@ -741,6 +741,33 @@ class HostedWebHTTPTests(unittest.TestCase):
         self.assertLess(requests[1]["max_tokens"], requests[0]["max_tokens"])
         self.assertEqual(count, 1)
 
+    def test_anthropic_rejects_reported_output_over_remaining_budget(self):
+        payload = dict(self.hosted_payload("/v1/messages"), max_tokens=10)
+        search = self.anthropic_round({"tool_calls": [dict(call(), index=0)]}, "tool_calls")
+        search += [{"choices": [], "usage": {"completion_tokens": 7}}]
+        final = self.anthropic_round({"content": "Done"})
+        final += [{"choices": [], "usage": {"completion_tokens": 4}}]
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                body, requests, count = self.post_anthropic(dict(payload, stream=stream), [search, final],
+                    expected_status=200 if stream else 502)
+                self.assertEqual(([req["max_tokens"] for req in requests], count), ([10, 3], 1))
+                self.assertIn("outside the remaining token budget", body)
+                self.assertNotIn("message_stop", body)
+
+    def test_anthropic_zero_use_tool_is_not_advertised_or_executed(self):
+        payload = self.hosted_payload("/v1/messages")
+        payload["tools"][0]["max_uses"] = 0
+        payload["tools"].append({"type": "web_fetch_20250910", "name": "web_fetch"})
+        search = self.anthropic_round({"tool_calls": [dict(call(), index=0)]}, "tool_calls")
+        for choice in ({"type": "tool", "name": "web_search"}, {"type": "auto"}):
+            forced = choice["type"] == "tool"
+            _, requests, count = self.post_anthropic(dict(payload, tool_choice=choice), [] if forced else [search],
+                expected_status=400 if forced else 502)
+            self.assertEqual(count, 0)
+            if not forced:
+                self.assertNotIn("web_search", [tool["function"]["name"] for tool in requests[0]["tools"]])
+
     def test_anthropic_preserves_preambles_and_mixed_call_order_in_json_and_sse(self):
         payload = self.hosted_payload("/v1/messages")
         search = self.anthropic_round({"content": "Checking sources first.", "tool_calls": [
