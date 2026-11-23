@@ -9172,6 +9172,22 @@ def _chat_chunks_iter(obj, model):
         yield ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode("utf-8")
 
 
+def _inference_realm(model, target_realm, allowed_uids):
+    realm = target_realm or detect_model_realm(model) or CURRENT_REALM
+    owner = exclusive_realm(model)
+    if owner and realm != owner:
+        raise UpstreamStatus(400, "model is only available in realm '%s'; refusing cross-realm fallback" % owner)
+    if target_realm:
+        return realm
+    if POOL and allowed_uids is not None:
+        other = "intl" if realm == "cn" else "cn"
+        if (not owner and POOL.count_ready(realm, model=model, allowed_uids=allowed_uids) == 0
+                and POOL.count_ready(other, model=model, allowed_uids=allowed_uids) > 0):
+            return other
+        return realm
+    return fallback_realm_by_accounts(realm, model)
+
+
 def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                   only_account=None, on_queue=None):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
@@ -9219,27 +9235,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
     if only_account is not None and not target_realm:
         # issue #86：钉死账号时区域跟随该账号（自动路由可能把它换掉）
         target_realm = getattr(only_account, "realm", "") or None
-    realm = target_realm or detect_model_realm(model) or CURRENT_REALM
-    owner = exclusive_realm(model)
-    if owner and realm != owner:
-        raise UpstreamStatus(400, "model is only available in realm '%s'; refusing cross-realm fallback" % owner)
-    if not target_realm:
-        # 步2：只在**用户没显式指定**时，按账号可用性兜底换区
-        if POOL and allowed_uids is not None:
-            other = "intl" if realm == "cn" else "cn"
-            if (POOL.count_ready(realm, model=model, allowed_uids=allowed_uids) == 0
-                    and POOL.count_ready(other, model=model, allowed_uids=allowed_uids) > 0
-                    and not exclusive_realm(model)):
-                realm = other
-        else:
-            realm = fallback_realm_by_accounts(realm, model)
-        if realm != CURRENT_REALM:
-            # #26：换区可见（覆盖所有自动路径：独占表 / 清单驱动 / 账号回退）
-            log("request routed to realm %s (default=%s, model=%r)"
-                % (realm, CURRENT_REALM, model), tag="realm")
-            if usage_ctx is not None:
-                # 确定性原因 → 面板直接显示，不必自己推断
-                usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
+    realm = _inference_realm(model, target_realm, allowed_uids)
+    if not target_realm and realm != CURRENT_REALM:
+        log("request routed to realm %s (default=%s, model=%r)"
+            % (realm, CURRENT_REALM, model), tag="realm")
+        usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
     try:
         model_key = resolve_request_model(model, realm=realm)
     except ValueError as exc:
@@ -13791,7 +13791,9 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 scope = json.dumps([self._key_id_for_usage(), req_realm or ""])
                 web_request = qoder_anthropic_web.WebRequest(payload, scope, ACCOUNTS_DIR)
-                if web_request.limits and not web_tools_enabled():
+                if (web_request.limits
+                        and qoder_anthropic._tool_choice_to_chat(payload.get("tool_choice")) != "none"
+                        and not web_tools_enabled()):
                     raise ValueError("hosted web tools are disabled")
                 payload = web_request.payload
             except (ValueError, TypeError) as exc:
@@ -14031,7 +14033,6 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 declared_tools = list(payload.get("tools") or [])
             evidence = web_request.evidence if web_request else qoder_web_response.WebEvidence(declared_tools)
-            web_config = qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True)
             call_limit = sum(web_request.limits.values()) if web_request else payload.get("max_tool_calls", 8)
             if type(call_limit) is not int or call_limit < 0:
                 raise ValueError("max_tool_calls must be a non-negative integer")
@@ -14055,6 +14056,10 @@ class Handler(BaseHTTPRequestHandler):
             choice = chat_req.get("tool_choice")
             choice_kind = choice.get("type") if isinstance(choice, dict) else None
             web_disabled_by_choice = (str(choice_kind or choice or "").strip().lower() == "none")
+            web_config = (None if web_request and web_disabled_by_choice
+                          else qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True))
+            anthropic_forced = (choice["function"]["name"]
+                                if web_request and choice_kind == "function" else None)
             forced_web = (qoder_webtools.WEB_SEARCH_NAME if choice_kind in qoder_webtools.SEARCH_DECL_TYPES
                           else qoder_webtools.WEB_FETCH_NAME if choice_kind in qoder_webtools.FETCH_DECL_TYPES
                           else None)
@@ -14069,8 +14074,15 @@ class Handler(BaseHTTPRequestHandler):
         chat_req["stream"] = False
         if ordinary_names and "parallel_tool_calls" not in payload:
             chat_req["parallel_tool_calls"] = False
+        disable_parallel = (web_request and isinstance(payload.get("tool_choice"), dict)
+                            and payload["tool_choice"].get("disable_parallel_tool_use") is True)
+        if disable_parallel:
+            chat_req["parallel_tool_calls"] = False
         requested_tool = chat_req.get("tool_choice")
         forced_web = requested_tool if isinstance(requested_tool, str) and requested_tool in names else None
+        forced_tool = anthropic_forced if web_request else forced_web
+        required_tool = web_request and not forced_tool and requested_tool == "required"
+        tokens_left = int(chat_req["max_tokens"]) if web_request else None
         if not web_request:
             self._apply_context_header(chat_req)
         model = str(chat_req.get("model") or "")
@@ -14112,6 +14124,9 @@ class Handler(BaseHTTPRequestHandler):
         all_names = names | ordinary_names
         round_limit = max(1, WEB_TOOLS_MAX_ROUNDS)
         resume = web_request.resume if web_request else None
+        content_emitted = False
+        if web_request and forced_tool and forced_tool not in all_names:
+            return fail(400, "tool_choice names an undeclared tool", "invalid_request_error")
 
         def web_error(name, arguments):
             if calls_used >= call_limit:
@@ -14153,19 +14168,10 @@ class Handler(BaseHTTPRequestHandler):
             account = resume.account
             if web_disabled_by_choice or web_config != resume.config:
                 return fail(400, "pending web tools require unchanged web settings")
-            if POOL is not None:
-                if POOL.get(account.uid) is not account or not account.enabled:
-                    return fail(403, "pending web tool account is no longer available")
-                try:
-                    route = qoder_routing.resolve(ACCOUNTS_DIR, list(POOL.accounts), model,
-                        key=usage_ctx["_key_entry"] or {}, explicit_realm=realm or account.realm)
-                except ValueError:
-                    return fail(403, "pending web tool account is outside routing scope")
-                allowed = route["allowed_uids"]
-                if (allowed is not None and account.uid not in allowed) or route["realm"] not in (None, "", account.realm):
-                    return fail(403, "pending web tool account is outside routing scope")
-            realm = account.realm
-            self.realm_used = realm
+            rounds = resume.rounds
+            if rounds > round_limit:
+                return fail(400, "pending web tools exceed the current round limit")
+            tokens_left = min(tokens_left, resume.tokens_left)
             web_request.used_before = resume.usage
             calls_used = sum(resume.usage.values())
             pending = {"role": "assistant", "content": "", "tool_calls": []}
@@ -14174,6 +14180,22 @@ class Handler(BaseHTTPRequestHandler):
             # Cache completed calls of this batch so concurrent continuations do not
             # re-run search before receiving their own synthesis response.
             with resume.lock:
+                if POOL is not None:
+                    if POOL.get(account.uid) is not account or not account.enabled:
+                        return fail(403, "pending web tool account is no longer available")
+                    try:
+                        route = qoder_routing.resolve(ACCOUNTS_DIR, list(POOL.accounts), model,
+                            key=usage_ctx["_key_entry"] or {}, explicit_realm=realm)
+                        allowed = route["allowed_uids"]
+                        live_realm = _inference_realm(model, route["realm"], allowed)
+                    except (ValueError, UpstreamStatus):
+                        return fail(403, "pending web tool account is outside routing scope")
+                    if live_realm != account.realm or (allowed is not None and account.uid not in allowed):
+                        return fail(403, "pending web tool account is outside routing scope")
+                    if not account.ready(model=model):
+                        return fail(403, "pending web tool account is no longer available")
+                realm = account.realm
+                self.realm_used = realm
                 tool_account = copy.copy(account)
                 if resume.account_identity(tool_account) != resume.identity:
                     return fail(409, "pending web tool account credentials changed")
@@ -14198,24 +14220,35 @@ class Handler(BaseHTTPRequestHandler):
                 web_output.tool_result(block, observed)
             insert_at = len(messages) - 1 if messages and messages[-1].get("role") == "user" else len(messages)
             messages[insert_at:insert_at] = [pending] + tool_results
-            forced_web = None
         # Reserve a synthesis turn after the last allowed tool round. Previously
         # the last tool results were discarded and its pending calls leaked out.
         for turn in range(round_limit + 1):
             req = dict(chat_req, messages=messages)
-            no_web = turn >= round_limit or calls_used >= call_limit or web_disabled_by_choice
-            if no_web:
+            first = turn == 0 and resume is None
+            no_web = rounds >= round_limit or calls_used >= call_limit or web_disabled_by_choice
+            if web_request:
+                req["max_tokens"] = tokens_left
+            if web_request and web_disabled_by_choice:
+                req.update(tools=[], tool_choice="none")
+            elif no_web:
                 req["tools"] = [t for t in (req.get("tools") or [])
                                 if _tool_declared_name(t) not in names]
                 req["tool_choice"] = ("none" if web_disabled_by_choice
                                       or not req["tools"] else "auto")
-            elif turn or resume:
+            elif not first:
                 # A required/forced search applies to the first turn, not forever.
                 req["tool_choice"] = "auto"
-            elif forced_web:
+            if first and forced_tool and (web_request or not no_web):
                 # Qoder accepts schemas but has no wire-level tool_choice. Hide
                 # other choices on the first round and verify the returned call.
-                req["tools"] = [t for t in req["tools"] if _tool_declared_name(t) == forced_web]
+                req["tools"] = [t for t in req["tools"] if _tool_declared_name(t) == forced_tool]
+                if not req["tools"]:
+                    return fail(400, "the requested tool is unavailable", "invalid_request_error")
+                req["tool_choice"] = forced_tool
+            elif first and required_tool:
+                if not req["tools"]:
+                    return fail(400, "tool_choice any requires an available tool", "invalid_request_error")
+                req["tool_choice"] = "required"
             try:
                 resp, account, _ = open_upstream(
                     req, target_realm=realm, usage_ctx=usage_ctx,
@@ -14276,10 +14309,16 @@ class Handler(BaseHTTPRequestHandler):
                             details[name] = details.get(name, 0) + value
             choice = (obj.get("choices") or [{}])[0]
             msg = choice.get("message") or {}
+            if web_request:
+                tokens_left -= qoder_anthropic_web.completion_tokens(_u, msg)
             if choice.get("finish_reason") == "content_filter":
                 msg.pop("tool_calls", None)
                 break
             all_calls = msg.get("tool_calls") or []
+            if web_request and web_disabled_by_choice and all_calls:
+                return fail(502, "upstream returned a tool call when tool_choice is none")
+            if disable_parallel and len(all_calls) > 1:
+                return fail(502, "upstream returned parallel tool calls with parallel tool use disabled")
             declared_calls = [call for call in all_calls
                               if (call.get("function") or {}).get("name") in all_names]
             if len(declared_calls) != len(all_calls):
@@ -14287,12 +14326,21 @@ class Handler(BaseHTTPRequestHandler):
                     return fail(502, "upstream returned an undeclared tool call")
                 all_calls = declared_calls
                 msg["tool_calls"] = all_calls
+            if first and forced_tool and (web_request or not no_web):
+                matching = [c for c in all_calls if c["function"]["name"] == forced_tool]
+                if choice.get("finish_reason") == "length":
+                    if web_request and len(matching) != len(all_calls):
+                        all_calls = msg["tool_calls"] = matching
+                elif not matching or len(matching) != len(all_calls):
+                    kind = "tool" if web_request else "hosted web tool"
+                    return fail(502, "upstream did not call the requested " + kind)
+            if first and required_tool and not all_calls and choice.get("finish_reason") != "length":
+                return fail(502, "upstream did not call a required tool")
             calls = [c for c in all_calls if (c.get("function") or {}).get("name") in names]
-            if forced_web and turn == 0 and not no_web and choice.get("finish_reason") != "length":
-                if not all_calls or any((c.get("function") or {}).get("name") != forced_web for c in all_calls):
-                    return fail(502, "upstream did not call the requested hosted web tool")
             if not calls:
                 break
+            if web_request and tokens_left <= 0:
+                choice["finish_reason"] = "length"
             if choice.get("finish_reason") == "length":
                 client_calls = [c for c in all_calls if (c.get("function") or {}).get("name") not in names]
                 if client_calls:
@@ -14303,17 +14351,19 @@ class Handler(BaseHTTPRequestHandler):
             if no_web:
                 return fail(502, "upstream requested a disabled web tool")
             client_calls = [call for call in all_calls if call not in calls]
+            rounds += 1
             if client_calls and web_request:
                 client_ids = {call.get("id") for call in client_calls}
                 if None in client_ids or "" in client_ids or len(client_ids) != len(client_calls):
                     return fail(502, "upstream client tool calls require unique IDs")
-                deferred = web_request.defer(calls, client_calls, account, web_config)
-                for block in deferred.blocks:
-                    web_output.append(block)
-                msg["tool_calls"] = client_calls
+                deferred = web_request.defer(calls, client_calls, account, web_config,
+                                             rounds=rounds, tokens_left=tokens_left)
+                web_output.tool_round(obj, names, deferred)
+                content_emitted = True
                 choice["finish_reason"] = "tool_calls"
                 break
-            rounds += 1
+            if web_request:
+                web_output.tool_round(obj, names)
             log("web tools: round %d, %d call(s) -> gateway execution" % (rounds, len(calls)), tag="webtools")
             assistant = {"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls}
             if msg.get("reasoning_content"):
@@ -14338,6 +14388,9 @@ class Handler(BaseHTTPRequestHandler):
             _usage.update(_acc)
             _usage.update({k: v for k, v in _details.items() if v})
             obj = dict(obj, usage=_usage)
+        if web_request:
+            message = web_output.finish(obj, content_emitted=content_emitted)
+            return None if want_stream else self._json(200, message)
         for choice in obj.get("choices") or []:
             message = choice.get("message") or {}
             if isinstance(message.get("content"), str):
@@ -14346,9 +14399,6 @@ class Handler(BaseHTTPRequestHandler):
                 if citations:
                     message["annotations"] = [{"type": "url_citation", "url_citation": {
                         k: v for k, v in citation.items() if k != "type"}} for citation in citations]
-        if web_request:
-            message = web_output.finish(obj)
-            return None if want_stream else self._json(200, message)
         if is_responses:
             custom_names = custom_tool_names(declared_tools)
             tool_ns = chat_req.get("_qd_tool_ns") or {}
