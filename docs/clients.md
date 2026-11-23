@@ -26,6 +26,7 @@ Cherry Studio、Chatbox、NextChat、Kelivo 等客户端，按上面的通用参
 - 工具调用
 - 图像输入
 - 思考档位：`reasoning_effort`，也兼容 `reasoning.effort` 和 `thinking.effort` 两种写法
+- 思考内容：非流式返回 `choices[0].message.reasoning_content`，流式返回 `delta.reasoning_content`；用量见 `usage.completion_tokens_details.reasoning_tokens`（DeepSeek-Flash `high` 档实测有值）
 
 旧版的 `/v1/completions`（使用 `prompt` 字段）不支持，会返回 404。
 
@@ -76,7 +77,7 @@ export ANTHROPIC_MODEL="Qwen3.8-Max"
 
 | 差异 | 说明 |
 |---|---|
-| 没有 thinking block | Anthropic 规范要求 thinking block 带服务端签名，网关无法生成，因此默认不输出。可在无签名校验的下游链路开启 `empty` 模式输出空签名 thinking block（详见 `configuration.md`，支持按 Key 或全局开启） |
+| thinking block 无官方签名 | Anthropic 规范要求 thinking block 带服务端签名，网关无法生成。请求里显式带 `thinking:enabled/adaptive`（或 `output_config.effort`）时会输出空签名 thinking block；不带思考参数的请求默认不输出。可在 `configuration.md` 查看按 Key / 面板 / 环境变量强制开关的方法 |
 | 历史中的 thinking block 会被丢弃 | 网关无法校验它的签名，所以不会转发给上游 |
 | 流式请求出错不会重试 | `message_start` 已经发出后不能重新开始，网关会发送 `event: error` 结束这次请求。非流式请求仍然正常重试 |
 | `count_tokens` 是本地估算 | 不会请求上游 |
@@ -86,6 +87,8 @@ export ANTHROPIC_MODEL="Qwen3.8-Max"
 同一轮对话里的多次推理共用 `max_tokens`。上游未提供可用的输出用量时，网关按可见文本与工具内容的 UTF-8 字节数预留后续预算（不是实际 token 计费）；上游报告超过本轮剩余额度时，网关返回错误，不再执行该轮的联网调用。挂起的搜索或抓取也算一轮联网工具调用，续传时会按当前路由重新检查原账号能否继续使用。
 
 搜索结果可随会话历史回传。重启网关后继续使用原历史，需保留网关设置和同一个 API Key、区域。
+
+thinking block 的输出顺序与原生 API 一致：**thinking 在 text 之前**（非流式 `content[]` 与流式 `content_block_start` 同序）。DeepSeek-Flash `thinking:enabled` 实测非流式返回 `['thinking','text']`、流式先发 `thinking` 的 `content_block_start`，reasoning 用量在 `usage.output_tokens_details.reasoning_tokens`。
 
 `messages` 里的 system 消息默认会原位改成 user 消息，让顶层 system 每一轮都保持不变，从而保证前缀缓存的命中率（`QD_ANTHROPIC_MSG_SYSTEM`）。
 

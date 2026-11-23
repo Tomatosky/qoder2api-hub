@@ -100,8 +100,14 @@
 
 请求里的写法支持 `reasoning_effort`、`reasoning.effort`、`thinking.effort` 或 `thinking.level`。
 
+实测结论（DeepSeek-Flash，`reasoning_effort=high`）：
+
+- OpenAI 端点：非流式返回 `choices[0].message.reasoning_content`，流式返回逐片 `delta.reasoning_content`；用量在 `usage.completion_tokens_details.reasoning_tokens` 计量（实测非流式 155 字符 / 57 tokens，流式同样有增量）
+- Anthropic 端点：`thinking` block 排在 `text` 之前（非流式 `content[]` 与流式 `content_block_start` 同序），`signature` 为空；reasoning 用量落在 `usage.output_tokens_details.reasoning_tokens`
+
 Anthropic 入口的额外规则：
 
 - 档位按 `thinking.effort` → `output_config.effort` → `thinking.budget_tokens` 的顺序取第一个有效值。Claude Code 对第三方模型名发送的是 `thinking={"type":"adaptive"}` 加 `output_config.effort`，因此按后者处理
 - `thinking.budget_tokens` 按区间映射：≤1024 为 `minimal`，≤4096 为 `low`，≤16384 为 `medium`，≤32768 为 `high`，更大为 `max`
 - `thinking.type` 为 `disabled` 时不下发档位，由上游按模型默认处理
+- 输出顺序：`thinking` block 永远排在 `text` 之前（Anthropic 客户端按块顺序渲染和回传）
