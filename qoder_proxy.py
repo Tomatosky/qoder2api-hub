@@ -13789,6 +13789,11 @@ class Handler(BaseHTTPRequestHandler):
         web_request = None
         if qoder_anthropic_web.applies(payload):
             try:
+                raw_choice = payload.get("tool_choice")
+                if isinstance(raw_choice, dict) and raw_choice.get("type") == "tool":
+                    name = raw_choice.get("name")
+                    if not isinstance(name, str) or not name.strip():
+                        raise ValueError("tool_choice tool requires a non-empty name")
                 scope = json.dumps([self._key_id_for_usage(), req_realm or ""])
                 web_request = qoder_anthropic_web.WebRequest(payload, scope, ACCOUNTS_DIR)
                 if (web_request.limits
@@ -14320,7 +14325,7 @@ class Handler(BaseHTTPRequestHandler):
             msg = choice.get("message") or {}
             if web_request:
                 reported_output = _u.get("completion_tokens")
-                if reported_output is not None and (type(reported_output) is not int
+                if "completion_tokens" in _u and (type(reported_output) is not int
                                                      or not 0 <= reported_output <= tokens_left):
                     return fail(502, "upstream output usage is outside the remaining token budget")
                 tokens_left -= qoder_anthropic_web.completion_tokens(_u, msg)

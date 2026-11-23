@@ -755,6 +755,19 @@ class HostedWebHTTPTests(unittest.TestCase):
                 self.assertIn("outside the remaining token budget", body)
                 self.assertNotIn("message_stop", body)
 
+    def test_anthropic_rejects_missing_named_choice_and_invalid_explicit_usage(self):
+        payload = self.hosted_payload("/v1/messages")
+        for choice in ({"type": "tool"}, {"type": "tool", "name": ""},
+                       {"type": "tool", "name": 123}):
+            _, requests, count = self.post_anthropic(dict(payload, tool_choice=choice), [], expected_status=400)
+            self.assertEqual((requests, count), ([], 0))
+        search = self.anthropic_round({"tool_calls": [dict(call(), index=0)]}, "tool_calls")
+        for value in (None, True, "4", -1):
+            malformed = search + [{"choices": [], "usage": {"completion_tokens": value}}]
+            body, requests, count = self.post_anthropic(payload, [malformed], expected_status=502)
+            self.assertEqual((len(requests), count), (1, 0))
+            self.assertIn("outside the remaining token budget", body)
+
     def test_anthropic_zero_use_tool_is_not_advertised_or_executed(self):
         payload = self.hosted_payload("/v1/messages")
         payload["tools"][0]["max_uses"] = 0
