@@ -8012,10 +8012,31 @@ _REQUEST_FAULT_MARKERS = ("invalid_parameter_error", "invalid_request_error",
                           '"Range of ') + _CONTENT_POLICY_MARKERS
 
 
+def _is_upstream_model_rejection(code, detail):
+    """Recognize the explicit provider model-resolution error, not arbitrary text."""
+    if _to_int_status(code) not in (400, 404):
+        return False
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except ValueError:
+            return False
+    if not isinstance(detail, dict):
+        return False
+    error = detail.get("error", detail)
+    if not isinstance(error, dict):
+        return False
+    return ("provider_error" in (error.get("code"), error.get("type"))
+            and str(error.get("message") or "").strip().casefold() == "cannot find model")
+
+
+_MODEL_REJECTION_DETAIL = '{"code":"provider_error","message":"Cannot find model"}'
+
+
 def _is_request_fault(code, detail):
     """请求自身的确定性错误（413 出站超限/参数非法/内容审核）：换号不改变结果。"""
-    return code == 413 or any(m in (detail or "")
-                              for m in _REQUEST_FAULT_MARKERS)
+    return (code == 413 or _is_upstream_model_rejection(code, detail)
+            or any(m in (detail or "") for m in _REQUEST_FAULT_MARKERS))
 
 
 def _is_image_conversion_timeout(detail):
@@ -8046,7 +8067,8 @@ def _is_transient_upstream(code, detail):
     detail = detail or ""
     if code in (401, 403, 429):
         return False        # 凭证/频控各自有专门处理路径，不属瞬时重试类
-    if any(m in detail for m in _CLIENT_FAULT_MARKERS):
+    if (_is_upstream_model_rejection(code, detail)
+            or any(m in detail for m in _CLIENT_FAULT_MARKERS)):
         return False
     if code in TRANSIENT_HTTP_CODES or code >= 500:
         return True
@@ -8241,6 +8263,11 @@ def friendly_upstream_error(code, detail):
     except Exception:
         code_i = 502
     _safe = _neutralize_auth_codes(detail)
+    if _is_upstream_model_rejection(code_i, detail):
+        return ("上游拒绝解析本次请求的模型（Cannot find model）。网关没有自动重试或轮换账号；"
+                "请核对 /v1/models 中的模型 ID、实际出口和客户端请求配置。"
+                "本错误本身不能证明模型下线或特定输入触发了上游规则。",
+                "upstream_model_rejected")
     if _is_image_conversion_timeout(detail):
         return ("上游图片转换超时 (HTTP %s)：图片转换服务在时限内未完成。"
                 "这不是 Key 失效；网关保留图片，限制自动重试且不冷却/轮换账号。"
@@ -8394,8 +8421,8 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         return
     status_int = _to_int_status(getattr(exc, "status", 502))
     detail = getattr(exc, "detail", "") or ""
-    # 图片转换是 provider 的请求处理阶段，不是账号健康信号。
-    if _is_image_conversion_timeout(detail):
+    # 请求形态或图片转换失败均不是账号健康信号。
+    if _is_upstream_model_rejection(status_int, detail) or _is_image_conversion_timeout(detail):
         return
     # issue #71：排队**不是账号问题**——必须在解绑会话/冷却之前短路，
     # 否则单号池会被打成「no usable account」，面板看起来就是凭证失效。
@@ -8764,6 +8791,8 @@ def should_retry_envelope(exc, emitted_bytes, attempt, usage_ctx=None):
         return False
     if emitted_bytes:
         return False
+    if _is_upstream_model_rejection(getattr(exc, "status", 502), getattr(exc, "detail", "")):
+        return False
     if _is_image_conversion_timeout(getattr(exc, "detail", "")):
         # Only one reopen before output; do not multiply slow conversions by pool size.
         return attempt < min(1, TRANSIENT_MAX_RETRIES) and _take_image_retry(usage_ctx)
@@ -9096,11 +9125,9 @@ WEB_TOOLS_MAX_ROUNDS = int(os.environ.get("QD_WEB_TOOLS_ROUNDS") or 3)
 
 def web_tools_enabled():
     """是否开启本地 web 工具：QD_WEB_TOOLS 优先，其次面板持久化开关。"""
-    raw = str(os.environ.get("QD_WEB_TOOLS") or "").strip().lower()
-    if raw in ("1", "on", "true", "yes", "enable", "enabled"):
-        return True
-    if raw in ("0", "off", "false", "no", "disable", "disabled"):
-        return False
+    enabled_env, _, _ = qoder_settings.web_tools_environment()
+    if enabled_env is not None:
+        return enabled_env
     try:
         return qoder_settings.web_tools_enabled(ACCOUNTS_DIR)
     except Exception:
@@ -9111,10 +9138,12 @@ def web_tools_settings_view():
     """Panel-only configuration view: API keys are never returned."""
     import qoder_external_web
     config = qoder_settings.web_tools_config(ACCOUNTS_DIR)
-    backend_env = (os.environ.get("QD_WEB_TOOLS_BACKEND") or "").strip().lower()
+    _, enabled_env, backend_env = qoder_settings.web_tools_environment()
     return {"web_tools_backend": backend_env or config["backend"],
             "web_tools_backend_env": backend_env,
-            "web_tools_enabled_env": (os.environ.get("QD_WEB_TOOLS") or "").strip().lower(),
+            "web_tools_enabled_env": enabled_env,
+            "web_fetch_backend": config["fetch_backend"],
+            "web_fetch_external": qoder_external_web.public_profile(config["external_fetch"]),
             "web_tools_external": qoder_external_web.public_profile(config["external"]),
             "web_tools_external_profiles": {name: qoder_external_web.public_profile(profile)
                 for name, profile in config["external_profiles"].items()}}
@@ -9415,6 +9444,19 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 except Exception:
                     pass
                 last_exc = exc
+                if _is_upstream_model_rejection(exc.code, detail):
+                    detail = exc.qoder_detail = _MODEL_REJECTION_DETAIL
+                    exc.close()
+                    # Keep request text and raw provider data out of this diagnostic.
+                    log("upstream model rejected: status=%s realm=%s messages=%d tools=%d images=%d"
+                        % (exc.code, realm, len(body_obj.get("messages") or []),
+                           len(body_obj.get("tools") or []),
+                           sum(1 for msg in body_obj.get("messages") or []
+                               for part in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+                               if isinstance(part, dict) and part.get("type") == "image_url")),
+                        level="WARN", tag="chat")
+                    # Break to the common lease release and request-fault path.
+                    break
                 # issue #38：上游排队 -> 等放行后重试同一账号（不把排队 JSON
                 # 交给客户端）。仅在预算与单轮上限内等待；超出即按原错误走
                 # 既有分类（fail-open 语义不变）。
@@ -9902,6 +9944,8 @@ def iter_inner_sse(resp, holder=None):
         status = outer.get("statusCodeValue")
         body = outer.get("body")
         if status not in (None, 200, "200"):
+            if _is_upstream_model_rejection(status, body):
+                raise UpstreamStatus(status, _MODEL_REJECTION_DETAIL)
             note_queue_observation(scope, body)
             limit = 8192 if holder and holder.get("_queue_probe_once") else 400
             raise UpstreamStatus(status, body if isinstance(body, str)
@@ -9915,6 +9959,8 @@ def iter_inner_sse(resp, holder=None):
         except Exception:
             continue
         if isinstance(inner, dict):
+            if isinstance(inner.get("error"), dict) and _is_upstream_model_rejection(400, inner):
+                raise UpstreamStatus(400, _MODEL_REJECTION_DETAIL)
             _capture_model_identity(inner, holder, getattr(resp, "_qd_model_audit", None))
             # Hosted orchestration must reject explicit errors even when a stop
             # frame precedes/follows them. Do not log or expose raw error bodies,
@@ -14074,10 +14120,18 @@ class Handler(BaseHTTPRequestHandler):
             choice = chat_req.get("tool_choice")
             choice_kind = choice.get("type") if isinstance(choice, dict) else None
             web_disabled_by_choice = (str(choice_kind or choice or "").strip().lower() == "none")
-            web_config = (None if web_request and web_disabled_by_choice
-                          else qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True))
             anthropic_forced = (choice["function"]["name"]
                                 if web_request and choice_kind == "function" else None)
+            ready_names = names
+            if web_request:
+                ready_names = {name for name, uses in web_request.limits.items() if uses > 0}
+                # A named client tool stops the request. A named web tool can
+                # still be followed by other hosted tools on later rounds.
+                if anthropic_forced and anthropic_forced not in names and not web_request.resume:
+                    ready_names.clear()
+            web_config = (None if web_request and web_disabled_by_choice else
+                          qoder_webtools.backend_config(ACCOUNTS_DIR,
+                              ready=not (web_request and web_request.resume), names=ready_names))
             forced_web = (qoder_webtools.WEB_SEARCH_NAME if choice_kind in qoder_webtools.SEARCH_DECL_TYPES
                           else qoder_webtools.WEB_FETCH_NAME if choice_kind in qoder_webtools.FETCH_DECL_TYPES
                           else None)
@@ -14184,11 +14238,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if resume:
             account = resume.account
-            if web_disabled_by_choice or web_config != resume.config:
-                return fail(400, "pending web tools require unchanged web settings")
             rounds = resume.rounds
             if rounds > round_limit:
                 return fail(400, "pending web tools exceed the current round limit")
+            relevant_names = {block["name"] for block in resume.blocks}
+            if rounds < round_limit and sum(resume.usage.values()) < call_limit:
+                relevant_names.update(name for name, limit in web_request.limits.items()
+                                      if resume.usage.get(name, 0) < limit)
+            operational = qoder_webtools.operational_config
+            if web_disabled_by_choice or operational(web_config, relevant_names) != operational(resume.config, relevant_names):
+                return fail(400, "pending web tools require unchanged web settings")
             tokens_left = min(tokens_left, resume.tokens_left)
             web_request.used_before = resume.usage
             calls_used = sum(resume.usage.values())
@@ -14304,6 +14363,12 @@ class Handler(BaseHTTPRequestHandler):
                     obj = aggregate_stream(resp, model, holder={
                         "usage": None, "_hosted_web_fail_on_inner_error": True},
                         allowed_names=round_names, require_terminal=True)
+            except UpstreamStatus as exc:
+                code = _to_int_status(exc.status)
+                if _is_upstream_model_rejection(code, exc.detail):
+                    msg, kind = friendly_upstream_error(code, exc.detail)
+                    return fail(code, msg, kind)
+                return fail(502, "upstream stream failed")
             except Exception:
                 # This block only consumes the upstream body. Socket errors
                 # here are source failures. Client write errors propagate.
