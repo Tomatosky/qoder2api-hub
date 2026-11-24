@@ -8012,10 +8012,31 @@ _REQUEST_FAULT_MARKERS = ("invalid_parameter_error", "invalid_request_error",
                           '"Range of ') + _CONTENT_POLICY_MARKERS
 
 
+def _is_upstream_model_rejection(code, detail):
+    """Recognize the explicit provider model-resolution error, not arbitrary text."""
+    if _to_int_status(code) not in (400, 404):
+        return False
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except ValueError:
+            return False
+    if not isinstance(detail, dict):
+        return False
+    error = detail.get("error", detail)
+    if not isinstance(error, dict):
+        return False
+    return ("provider_error" in (error.get("code"), error.get("type"))
+            and str(error.get("message") or "").strip().casefold() == "cannot find model")
+
+
+_MODEL_REJECTION_DETAIL = '{"code":"provider_error","message":"Cannot find model"}'
+
+
 def _is_request_fault(code, detail):
     """请求自身的确定性错误（413 出站超限/参数非法/内容审核）：换号不改变结果。"""
-    return code == 413 or any(m in (detail or "")
-                              for m in _REQUEST_FAULT_MARKERS)
+    return (code == 413 or _is_upstream_model_rejection(code, detail)
+            or any(m in (detail or "") for m in _REQUEST_FAULT_MARKERS))
 
 
 def _is_image_conversion_timeout(detail):
@@ -8046,7 +8067,8 @@ def _is_transient_upstream(code, detail):
     detail = detail or ""
     if code in (401, 403, 429):
         return False        # 凭证/频控各自有专门处理路径，不属瞬时重试类
-    if any(m in detail for m in _CLIENT_FAULT_MARKERS):
+    if (_is_upstream_model_rejection(code, detail)
+            or any(m in detail for m in _CLIENT_FAULT_MARKERS)):
         return False
     if code in TRANSIENT_HTTP_CODES or code >= 500:
         return True
@@ -8231,6 +8253,11 @@ def friendly_upstream_error(code, detail):
     except Exception:
         code_i = 502
     _safe = _neutralize_auth_codes(detail)
+    if _is_upstream_model_rejection(code_i, detail):
+        return ("上游拒绝解析本次请求的模型（Cannot find model）。网关没有自动重试或轮换账号；"
+                "请核对 /v1/models 中的模型 ID、实际出口和客户端请求配置。"
+                "本错误本身不能证明模型下线或特定输入触发了上游规则。",
+                "upstream_model_rejected")
     if _is_image_conversion_timeout(detail):
         return ("上游图片转换超时 (HTTP %s)：图片转换服务在时限内未完成。"
                 "这不是 Key 失效；网关保留图片，限制自动重试且不冷却/轮换账号。"
@@ -8384,8 +8411,8 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         return
     status_int = _to_int_status(getattr(exc, "status", 502))
     detail = getattr(exc, "detail", "") or ""
-    # 图片转换是 provider 的请求处理阶段，不是账号健康信号。
-    if _is_image_conversion_timeout(detail):
+    # 请求形态或图片转换失败均不是账号健康信号。
+    if _is_upstream_model_rejection(status_int, detail) or _is_image_conversion_timeout(detail):
         return
     # issue #71：排队**不是账号问题**——必须在解绑会话/冷却之前短路，
     # 否则单号池会被打成「no usable account」，面板看起来就是凭证失效。
@@ -8753,6 +8780,8 @@ def should_retry_envelope(exc, emitted_bytes, attempt, usage_ctx=None):
     if isinstance(exc, InvalidToolArguments):
         return False
     if emitted_bytes:
+        return False
+    if _is_upstream_model_rejection(getattr(exc, "status", 502), getattr(exc, "detail", "")):
         return False
     if _is_image_conversion_timeout(getattr(exc, "detail", "")):
         # Only one reopen before output; do not multiply slow conversions by pool size.
@@ -9405,6 +9434,19 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 except Exception:
                     pass
                 last_exc = exc
+                if _is_upstream_model_rejection(exc.code, detail):
+                    detail = exc.qoder_detail = _MODEL_REJECTION_DETAIL
+                    exc.close()
+                    # Keep request text and raw provider data out of this diagnostic.
+                    log("upstream model rejected: status=%s realm=%s messages=%d tools=%d images=%d"
+                        % (exc.code, realm, len(body_obj.get("messages") or []),
+                           len(body_obj.get("tools") or []),
+                           sum(1 for msg in body_obj.get("messages") or []
+                               for part in (msg.get("content") if isinstance(msg.get("content"), list) else [])
+                               if isinstance(part, dict) and part.get("type") == "image_url")),
+                        level="WARN", tag="chat")
+                    # Break to the common lease release and request-fault path.
+                    break
                 # issue #38：上游排队 -> 等放行后重试同一账号（不把排队 JSON
                 # 交给客户端）。仅在预算与单轮上限内等待；超出即按原错误走
                 # 既有分类（fail-open 语义不变）。
@@ -9892,6 +9934,8 @@ def iter_inner_sse(resp, holder=None):
         status = outer.get("statusCodeValue")
         body = outer.get("body")
         if status not in (None, 200, "200"):
+            if _is_upstream_model_rejection(status, body):
+                raise UpstreamStatus(status, _MODEL_REJECTION_DETAIL)
             note_queue_observation(scope, body)
             limit = 8192 if holder and holder.get("_queue_probe_once") else 400
             raise UpstreamStatus(status, body if isinstance(body, str)
@@ -9905,6 +9949,8 @@ def iter_inner_sse(resp, holder=None):
         except Exception:
             continue
         if isinstance(inner, dict):
+            if isinstance(inner.get("error"), dict) and _is_upstream_model_rejection(400, inner):
+                raise UpstreamStatus(400, _MODEL_REJECTION_DETAIL)
             _capture_model_identity(inner, holder, getattr(resp, "_qd_model_audit", None))
             # Hosted orchestration must reject explicit errors even when a stop
             # frame precedes/follows them. Do not log or expose raw error bodies,
@@ -14291,6 +14337,12 @@ class Handler(BaseHTTPRequestHandler):
                     obj = aggregate_stream(resp, model, holder={
                         "usage": None, "_hosted_web_fail_on_inner_error": True},
                         allowed_names=round_names, require_terminal=True)
+            except UpstreamStatus as exc:
+                code = _to_int_status(exc.status)
+                if _is_upstream_model_rejection(code, exc.detail):
+                    msg, kind = friendly_upstream_error(code, exc.detail)
+                    return fail(code, msg, kind)
+                return fail(502, "upstream stream failed")
             except Exception:
                 # This block only consumes the upstream body. Socket errors
                 # here are source failures. Client write errors propagate.
