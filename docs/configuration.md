@@ -231,7 +231,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `QD_ANTHROPIC_MSG_SYSTEM` | `inline` | `messages` 里的 system 消息如何处理：`inline` 原位改为 user 消息（保持缓存前缀稳定）；`merge` 合并到顶层 system（旧行为）；`drop` 丢弃 |
-| `QD_ANTHROPIC_THINKING` | 请求驱动 | `empty` 表示强制输出带空 `signature` 的 thinking block，`off` 表示强制关闭。未设置时按请求决定：客户端显式要思考（`thinking:enabled/adaptive` 或 `output_config.effort`）才输出 `empty`，否则 `off`；支持在面板设置或按 API Key 单独覆盖 |
+| `QD_ANTHROPIC_THINKING` | 请求驱动 | `empty` 表示有思考内容时输出带空 `signature` 的兼容块，`off` 表示隐藏该块；两者均不改变上游思考档位。未设置时按有效请求意图决定；未指定或显式关闭则为 `off`。支持在面板设置或按 API Key 单独覆盖 |
 
 #### QD_ANTHROPIC_THINKING 安全启用判定标准
 
@@ -245,7 +245,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
   1. **按 API Key 覆盖**：在 API Key 配置中设置 `"anthropic_thinking": "empty" | "off"`；
   2. **面板全局设置**：在设置页面或 API 中切换 `anthropic_thinking`；
   3. **进程级环境变量**：`QD_ANTHROPIC_THINKING=empty|off`（作为默认兜底）；
-  4. **请求驱动**：以上都没设置时，请求显式带 `thinking:enabled/adaptive` 或 `output_config.effort` 输出 `empty`；
+  4. **请求驱动**：以上都没设置时，`thinking.type=enabled/adaptive`、有效档位或正整数思考预算请求输出 `empty`；`thinking.type=disabled` 和有效档位 `none` 不请求输出；
   5. 其余请求默认为 `off`。
 
 ### 账号与设备身份

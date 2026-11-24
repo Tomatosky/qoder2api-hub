@@ -9934,9 +9934,10 @@ def iter_inner_sse(resp, holder=None):
                 note_queue_observation(scope, success=True)
                 if holder is not None:
                     holder["_upstream_finished"] = True
-            if holder is not None and inner.get("usage") \
-                    and not holder.get("usage"):
-                holder["usage"] = inner["usage"]
+            inner_usage = inner.get("usage")
+            if (holder is not None and isinstance(inner_usage, dict)
+                    and inner_usage and not holder.get("usage")):
+                holder["usage"] = inner_usage
         cleaned = clean_chunk(body)
         if not cleaned:
             continue
@@ -9976,10 +9977,9 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None,
             model = chunk["model"]
         if chunk.get("created"):
             created = chunk["created"]
-        if chunk.get("usage"):
-            usage = chunk["usage"]
-            if holder is not None:
-                holder["usage"] = usage
+        chunk_usage = chunk.get("usage")
+        if isinstance(chunk_usage, dict) and chunk_usage:
+            usage = holder["usage"] = chunk_usage
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             reason = choice.get("finish_reason")
@@ -13846,7 +13846,7 @@ class Handler(BaseHTTPRequestHandler):
             messages=chat_req.get("messages"))
         if web_request and web_request.limits:
             return self._handle_web_tools(path, payload, set(web_request.limits),
-                                          anthropic=(web_request, chat_req))
+                                          anthropic=(web_request, chat_req, thinking_mode))
         holder = {"usage": None,
                   "allowed_names": _tool_names_from_payload(chat_req)}
         log("anthropic: model=%s stream=%s msgs=%d effort=%r structured=%s"
@@ -14039,7 +14039,7 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_web_tools(self, path, payload, names, anthropic=None):
         """Execute declared hosted web tools without client-side orchestration."""
         is_responses = path.endswith("/responses")
-        web_request, anthropic_chat = anthropic or (None, None)
+        web_request, anthropic_chat, thinking_mode = anthropic or (None, None, None)
         want_stream = bool(payload.get("stream"))
         names = set(names)
         # Responses web_search includes opening sources, not just a query.
@@ -14118,7 +14118,7 @@ class Handler(BaseHTTPRequestHandler):
             web_output.start()
         elif web_request:
             web_output = qoder_anthropic_web.WebOutput(
-                web_request, model, anthropic_thinking_mode(getattr(self, "key_entry", None)),
+                web_request, model, thinking_mode,
                 self._sse_begin if want_stream else None, self._sse_write if want_stream else None)
 
         def fail(status, message, kind="upstream_error"):

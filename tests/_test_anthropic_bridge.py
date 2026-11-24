@@ -201,10 +201,10 @@ check("clamp：目标档不在表内 -> 取最近的更低档（无更低则最�
       and AN.effort_from_anthropic({"thinking": {"type": "enabled",
                                     "budget_tokens": 99999}},
                                    supported=["low", "medium"]) == "medium")
-check("无档位表 / disabled -> None（不下发，保持「不猜测」语义）",
+check("无档位表不下发档位；disabled 用 none 明确关闭",
       AN.effort_from_anthropic({"thinking": {"type": "enabled", "budget_tokens": 512}})
       is None
-      and AN.effort_from_anthropic({"thinking": {"type": "disabled"}}) is None)
+      and AN.effort_from_anthropic({"thinking": {"type": "disabled"}}) == "none")
 check("catalog_meta fallback（thinking_config.enabled.efforts）",
       AN.effort_from_anthropic({"thinking": {"type": "enabled", "budget_tokens": 512}},
                                catalog_meta={"thinking_config": {"enabled": {

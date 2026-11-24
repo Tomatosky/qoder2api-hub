@@ -77,7 +77,7 @@ export ANTHROPIC_MODEL="Qwen3.8-Max"
 
 | 差异 | 说明 |
 |---|---|
-| thinking block 无官方签名 | Anthropic 规范要求 thinking block 带服务端签名，网关无法生成。请求里显式带 `thinking:enabled/adaptive`（或 `output_config.effort`）时会输出空签名 thinking block；不带思考参数的请求默认不输出。可在 `configuration.md` 查看按 Key / 面板 / 环境变量强制开关的方法 |
+| thinking block 无官方签名 | 网关只能提供空签名兼容块，不能用于签名校验。未设覆盖项时，显式请求思考才输出；未指定或显式关闭则不输出。按 Key / 面板 / 环境变量的覆盖见 `configuration.md` |
 | 历史中的 thinking block 会被丢弃 | 网关无法校验它的签名，所以不会转发给上游 |
 | 流式请求出错不会重试 | `message_start` 已经发出后不能重新开始，网关会发送 `event: error` 结束这次请求。非流式请求仍然正常重试 |
 | `count_tokens` 是本地估算 | 不会请求上游 |
@@ -88,7 +88,7 @@ export ANTHROPIC_MODEL="Qwen3.8-Max"
 
 搜索结果可随会话历史回传。重启网关后继续使用原历史，需保留网关设置和同一个 API Key、区域。
 
-thinking block 的输出顺序与原生 API 一致：**thinking 在 text 之前**（非流式 `content[]` 与流式 `content_block_start` 同序）。DeepSeek-Flash `thinking:enabled` 实测非流式返回 `['thinking','text']`、流式先发 `thinking` 的 `content_block_start`，reasoning 用量在 `usage.output_tokens_details.thinking_tokens`。
+每次模型推理中，思考兼容块先于正文或工具块；托管 Web 工具会拼接多次推理，因此后续思考块可能排在之前的正文和工具结果之后。普通 SSE 在关闭思考块前发空 `signature_delta`；正文或工具块开始后，迟到的思考片段不再输出，不影响上游用量。用量见网关扩展 `usage.output_tokens_details.thinking_tokens`，旧字段 `reasoning_tokens` 仍可用。
 
 `messages` 里的 system 消息默认会原位改成 user 消息，让顶层 system 每一轮都保持不变，从而保证前缀缓存的命中率（`QD_ANTHROPIC_MSG_SYSTEM`）。
 
