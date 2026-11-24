@@ -9115,11 +9115,9 @@ WEB_TOOLS_MAX_ROUNDS = int(os.environ.get("QD_WEB_TOOLS_ROUNDS") or 3)
 
 def web_tools_enabled():
     """是否开启本地 web 工具：QD_WEB_TOOLS 优先，其次面板持久化开关。"""
-    raw = str(os.environ.get("QD_WEB_TOOLS") or "").strip().lower()
-    if raw in ("1", "on", "true", "yes", "enable", "enabled"):
-        return True
-    if raw in ("0", "off", "false", "no", "disable", "disabled"):
-        return False
+    enabled_env, _, _ = qoder_settings.web_tools_environment()
+    if enabled_env is not None:
+        return enabled_env
     try:
         return qoder_settings.web_tools_enabled(ACCOUNTS_DIR)
     except Exception:
@@ -9130,10 +9128,12 @@ def web_tools_settings_view():
     """Panel-only configuration view: API keys are never returned."""
     import qoder_external_web
     config = qoder_settings.web_tools_config(ACCOUNTS_DIR)
-    backend_env = (os.environ.get("QD_WEB_TOOLS_BACKEND") or "").strip().lower()
+    _, enabled_env, backend_env = qoder_settings.web_tools_environment()
     return {"web_tools_backend": backend_env or config["backend"],
             "web_tools_backend_env": backend_env,
-            "web_tools_enabled_env": (os.environ.get("QD_WEB_TOOLS") or "").strip().lower(),
+            "web_tools_enabled_env": enabled_env,
+            "web_fetch_backend": config["fetch_backend"],
+            "web_fetch_external": qoder_external_web.public_profile(config["external_fetch"]),
             "web_tools_external": qoder_external_web.public_profile(config["external"]),
             "web_tools_external_profiles": {name: qoder_external_web.public_profile(profile)
                 for name, profile in config["external_profiles"].items()}}
@@ -14107,10 +14107,18 @@ class Handler(BaseHTTPRequestHandler):
             choice = chat_req.get("tool_choice")
             choice_kind = choice.get("type") if isinstance(choice, dict) else None
             web_disabled_by_choice = (str(choice_kind or choice or "").strip().lower() == "none")
-            web_config = (None if web_request and web_disabled_by_choice
-                          else qoder_webtools.backend_config(ACCOUNTS_DIR, ready=True))
             anthropic_forced = (choice["function"]["name"]
                                 if web_request and choice_kind == "function" else None)
+            ready_names = names
+            if web_request:
+                ready_names = {name for name, uses in web_request.limits.items() if uses > 0}
+                # A named client tool stops the request. A named web tool can
+                # still be followed by other hosted tools on later rounds.
+                if anthropic_forced and anthropic_forced not in names and not web_request.resume:
+                    ready_names.clear()
+            web_config = (None if web_request and web_disabled_by_choice else
+                          qoder_webtools.backend_config(ACCOUNTS_DIR,
+                              ready=not (web_request and web_request.resume), names=ready_names))
             forced_web = (qoder_webtools.WEB_SEARCH_NAME if choice_kind in qoder_webtools.SEARCH_DECL_TYPES
                           else qoder_webtools.WEB_FETCH_NAME if choice_kind in qoder_webtools.FETCH_DECL_TYPES
                           else None)
@@ -14217,11 +14225,16 @@ class Handler(BaseHTTPRequestHandler):
 
         if resume:
             account = resume.account
-            if web_disabled_by_choice or web_config != resume.config:
-                return fail(400, "pending web tools require unchanged web settings")
             rounds = resume.rounds
             if rounds > round_limit:
                 return fail(400, "pending web tools exceed the current round limit")
+            relevant_names = {block["name"] for block in resume.blocks}
+            if rounds < round_limit and sum(resume.usage.values()) < call_limit:
+                relevant_names.update(name for name, limit in web_request.limits.items()
+                                      if resume.usage.get(name, 0) < limit)
+            operational = qoder_webtools.operational_config
+            if web_disabled_by_choice or operational(web_config, relevant_names) != operational(resume.config, relevant_names):
+                return fail(400, "pending web tools require unchanged web settings")
             tokens_left = min(tokens_left, resume.tokens_left)
             web_request.used_before = resume.usage
             calls_used = sum(resume.usage.values())
