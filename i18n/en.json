@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 24
+    "version": 25
   },
   "messages": {
     "国内版服务入口": "China service endpoint",
@@ -858,7 +858,8 @@
     "网址参数名": "URL parameter name",
     "正文路径": "Page text path",
     "标题路径（可留空）": "Title path (optional)",
-    "最终网址路径（可留空）": "Final URL path (optional)",
+    "最终网址路径（必填）": "Final URL path (required)",
+    "服务地址的协议、主机或端口变更时，留空会清除旧密钥。": "If the endpoint scheme, host, or port changes, leaving the key blank clears the old key.",
     "。搜索和网页抓取可以分别选择后端。": ". Choose separate backends for search and page fetch.",
     "使用原项目内置引擎链搜索。": "Search uses the built-in engine chain.",
     "搜索使用当前推理账号的 Qoder 官方服务。": "Search uses the current inference account with Qoder's official service.",
@@ -867,7 +868,7 @@
     "当前沿用网关直接抓取。": "Using direct gateway fetch with the current search settings.",
     "由网关访问网页并提取正文。": "The gateway fetches pages and extracts readable text.",
     "用当前推理账号调用 Qoder 官方抓取。": "Fetches via Qoder's official service using the current inference account.",
-    "将网页网址发给自建抓取接口，读取返回的正文文本或 Markdown。": "Sends the page URL to your fetch service and reads the returned text or Markdown.",
+    "仅连接受信任的抓取服务：服务必须在连接时和每次重定向时验证目标为公网地址，并返回实际最终网址。": "Use only a trusted fetch service. It must enforce public destinations at connection time and at every redirect, and report the actual final URL.",
     "原项目内置（DuckDuckGo / Bing / Wikipedia）": "Built-in (DuckDuckGo / Bing / Wikipedia)",
     "外部搜索服务（本地或云端）": "External search service (local or cloud)",
     "服务类型": "Provider",
@@ -893,7 +894,7 @@
     "联网工具设置已保存，新请求立即生效": "Web tool settings saved; effective for new requests",
     "代跑客户端声明的内置": "Execute the client-declared built-in",
     "保存后对新请求立即生效，进行中的请求继续使用原配置；应用自己的普通 function 工具仍由应用执行。": "Changes apply immediately to new requests. In-flight requests retain their configuration; ordinary application functions remain client-owned.",
-    "多轮推理及外部服务可能产生各自的用量；网页抓取只允许公网地址。默认关闭。": "Inference rounds and external services may incur their own usage. Page fetches allow public addresses only. Disabled by default.",
+    "多轮推理及外部服务可能产生各自的用量。默认关闭。": "Inference rounds and external services may incur their own usage. Disabled by default.",
     "GET 使用查询参数，POST 使用 JSON 请求体。嵌套结果字段用点分隔；结果列表在根数组时路径留空。服务地址必须能由网关访问，容器内 localhost 指向容器自身。": "GET uses query parameters; POST uses a JSON body. Use dots for nested result fields, or leave the list path empty for a root array. The endpoint must be reachable from the gateway; localhost in Docker refers to that container.",
     "关闭网关": "Stop gateway",
     "停止当前网关进程（等价于 stop 脚本）。": "Stops the gateway process (equivalent to the stop script).",
@@ -909,6 +910,8 @@
     "当前进程未持有监听器（可能是测试或子进程）": "this process holds no listener (test or child process)"
   },
   "patterns": {
+    "搜索后端由环境变量固定为 {0}": "Search backend is fixed by the environment to {0}",
+    "总开关由环境变量固定为 {0}": "Web tools toggle is fixed by the environment to {0}",
     "正在申请{0}设备授权…": "Requesting device authorization for {0}…",
     "本次授权入口：{0}": "Authorization endpoint: {0}",
     "本次入口：{0}。请在浏览器完成授权；修改入口后原链接将移除，需重新生成。": "Endpoint: {0}. Complete authorization in your browser; changing the endpoint removes this link and requires regeneration.",

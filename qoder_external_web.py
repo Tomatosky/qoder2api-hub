@@ -29,7 +29,7 @@ _PRESETS = {
     "custom": {},
 }
 FETCH_DEFAULTS = {"endpoint": "", "method": "POST", "url_field": "url", "params": {},
-                  "text_path": "text", "title_path": "title", "final_url_path": "",
+                  "text_path": "text", "title_path": "title", "final_url_path": "final_url",
                   "api_key": "", "auth_header": "Authorization", "auth_prefix": "Bearer"}
 
 
@@ -60,9 +60,26 @@ def normalize_fetch(profile, ready=False):
     result = {key: copy.deepcopy(profile.get(key, default)) for key, default in FETCH_DEFAULTS.items()}
     _normalize_http_profile(result, "fetch", ("url_field",),
                             ("text_path", "title_path", "final_url_path"), ready)
-    if not result["text_path"]:
-        raise ValueError("external fetch text_path is required")
+    for key in ("text_path", "final_url_path"):
+        if not result[key]:
+            raise ValueError("external fetch %s is required" % key)
     return result
+
+
+def endpoint_origin(endpoint):
+    """Compare validated endpoint origins before reusing a stored credential."""
+    if not endpoint:
+        return None
+    parsed = urllib.parse.urlsplit(endpoint)
+    host = parsed.hostname
+    from ipaddress import ip_address
+    try:
+        host = str(ip_address(host))
+    except ValueError:
+        # Keep trailing dots and different hostname spellings distinct.
+        host = host.lower()
+    port = parsed.port if parsed.port is not None else {"http": 80, "https": 443}[parsed.scheme]
+    return parsed.scheme, host, port
 
 
 def _normalize_http_profile(result, label, input_fields, output_fields, ready):
@@ -228,11 +245,11 @@ def fetch(profile, url):
         text = field(data, profile["text_path"])
         if not isinstance(text, str) or not text.strip():
             return dict(result, error="external fetch response has no text at the configured path")
-        final_url = url
-        if profile["final_url_path"]:
-            final_url = field(data, profile["final_url_path"])
-            if not public_link(final_url) or (final_url != url and not check_url(final_url)[0]):
-                return dict(result, error="external fetch response has an invalid final URL")
+        # The configured fetcher is trusted to enforce public-only egress at
+        # connection time on every hop. This checks its report, not its transport.
+        final_url = field(data, profile["final_url_path"])
+        if not public_link(final_url) or not check_url(final_url)[0]:
+            return dict(result, error="external fetch response has an invalid final URL")
         title = clean_text(field(data, profile["title_path"]), 1000) if profile["title_path"] else ""
         return dict(result, ok=True, final_url=final_url, title=title,
                     text=text[:MAX_FETCH_CHARS], truncated=len(text) > MAX_FETCH_CHARS, error="")

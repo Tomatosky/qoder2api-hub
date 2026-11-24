@@ -884,7 +884,7 @@ class HostedWebHTTPTests(unittest.TestCase):
                 "external_fetch": {"endpoint": "http://fetcher:8080/fetch", "text_path": "data.markdown"}})
             for path, stream in ((path, stream) for path in self.HOSTED_PATHS for stream in (False, True)):
                 with self.subTest(path=path, stream=stream), mock.patch.object(qoder_external_web, "_json_request",
-                        return_value={"data": {"markdown": "Fetched by the configured service"}}) as remote:
+                        return_value={"data": {"markdown": "Fetched by the configured service"}, "final_url": url}) as remote:
                     payload = self.hosted_payload(path, stream=stream)
                     history = payload.get("messages") or payload["input"]
                     history[0]["content"] = "Read " + url
@@ -940,9 +940,15 @@ class HostedWebHTTPTests(unittest.TestCase):
             self.assertEqual(count, 0)
             resume = self.resume_messages(payload, json.loads(body))
             fetched = {"results": [{"statusCode": 200, "markdown": "Official fetch"}]}
+            P.qoder_settings.set_web_tools_config(directory, {"external": {"provider": "brave", "api_key": "unused-key"}})
             body, requests, count = self.post_anthropic(resume, [final], fetched=fetched, **options)
             self.assertIn("Official fetch", body)
             self.assertEqual((requests[0]["max_tokens"], count), (116, 1))
+            P.qoder_settings.set_web_tools_config(directory, {"fetch_backend": "local"})
+            body, requests, count = self.post_anthropic(resume, [], expected_status=400, **options)
+            self.assertIn("unchanged web settings", body)
+            self.assertEqual((requests, count), ([], 0))
+            P.qoder_settings.set_web_tools_config(directory, {"fetch_backend": "qoder"})
             account.access_token = "fake-rotated"
             body, requests, count = self.post_anthropic(resume, [], expected_status=409, **options)
             self.assertIn("account credentials changed", body)

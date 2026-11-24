@@ -4168,7 +4168,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
           <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.7">
             代跑客户端声明的内置 <code>web_search</code> / <code>web_fetch</code>。搜索和网页抓取可以分别选择后端。
             保存后对新请求立即生效，进行中的请求继续使用原配置；应用自己的普通 function 工具仍由应用执行。
-            <br>多轮推理及外部服务可能产生各自的用量；网页抓取只允许公网地址。默认关闭。
+            <br>多轮推理及外部服务可能产生各自的用量。默认关闭。
           </div>
         </div>
       </div>
@@ -4186,7 +4186,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
           </label>
         </div>
         <div id="setWebToolsBackendHelp" style="font-size:12px;color:var(--dim);margin-top:8px;line-height:1.7"></div>
-        <div id="setWebToolsEnv" style="font-size:12px;color:var(--warn);margin-top:6px"></div>
+        <div id="setWebToolsEnv" style="font-size:12px;color:var(--warn);margin-top:6px;white-space:pre-line"></div>
         <div id="setWebExternal" style="display:none">
           <div class="web-tools-grid">
             <label>服务类型
@@ -4246,6 +4246,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
           <label style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--dim);margin-top:8px">
             <input id="setWebFetchExternalClearKey" type="checkbox">清除抓取服务已保存的密钥
           </label>
+          <div style="font-size:12px;color:var(--dim);margin-top:8px">服务地址的协议、主机或端口变更时，留空会清除旧密钥。</div>
           <details style="margin-top:12px">
             <summary style="cursor:pointer;font-size:12px;color:var(--dim)">抓取请求与结果映射</summary>
             <div class="web-tools-grid">
@@ -4253,7 +4254,7 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
               <label>网址参数名<input id="setWebFetchExternalUrlField" placeholder="url"></label>
               <label>正文路径<input id="setWebFetchExternalTextPath" placeholder="text / data.markdown"></label>
               <label>标题路径（可留空）<input id="setWebFetchExternalTitlePath" placeholder="title"></label>
-              <label>最终网址路径（可留空）<input id="setWebFetchExternalFinalUrlPath" placeholder="data.url"></label>
+              <label>最终网址路径（必填）<input id="setWebFetchExternalFinalUrlPath" placeholder="final_url"></label>
               <label>认证请求头<input id="setWebFetchExternalAuthHeader" placeholder="Authorization / X-API-KEY"></label>
               <label>认证前缀（可留空）<input id="setWebFetchExternalAuthPrefix" placeholder="Bearer"></label>
               <label>其他固定参数（JSON 对象）<textarea id="setWebFetchExternalParams" rows="3" spellcheck="false">{}</textarea></label>
@@ -8454,7 +8455,7 @@ function updateWebToolsBackend(){
     inherit: backend === 'qoder' ? '当前沿用 Qoder 官方抓取。' : '当前沿用网关直接抓取。',
     local:'由网关访问网页并提取正文。',
     qoder:'用当前推理账号调用 Qoder 官方抓取。',
-    external:'将网页网址发给自建抓取接口，读取返回的正文文本或 Markdown。'
+    external:'仅连接受信任的抓取服务：服务必须在连接时和每次重定向时验证目标为公网地址，并返回实际最终网址。'
   }[fetchBackend] || '';
 }
 function readWebFetchProfile(){
@@ -8490,9 +8491,9 @@ function renderWebToolsSettings(data){
   document.getElementById('setWebTools').checked = data.web_tools === true;
   document.getElementById('setWebTools').disabled = !!data.web_tools_enabled_env;
   document.getElementById('setWebToolsEnv').textContent = [
-    data.web_tools_backend_env ? '后端由环境变量固定为 '+data.web_tools_backend_env : '',
+    data.web_tools_backend_env ? '搜索后端由环境变量固定为 '+data.web_tools_backend_env : '',
     data.web_tools_enabled_env ? '总开关由环境变量固定为 '+data.web_tools_enabled_env : ''
-  ].filter(Boolean).join('；');
+  ].filter(Boolean).join('\n');
   showWebExternalProfile((data.web_tools_external || {}).provider || 'searxng');
   updateWebToolsBackend();
   const names = {local:'原项目内置', qoder:'Qoder 官方', external:'外部服务'};
@@ -8501,10 +8502,12 @@ function renderWebToolsSettings(data){
 async function saveWebTools(btn){
   const form = document.getElementById('setWebToolsForm');
   try{
-    const payload = {enabled:document.getElementById('setWebTools').checked,
-                     backend:document.getElementById('setWebToolsBackend').value,
-                     fetch_backend:document.getElementById('setWebFetchBackend').value};
-    if(payload.backend === 'external') payload.external = readWebExternalProfile();
+    const enabled = document.getElementById('setWebTools');
+    const search = document.getElementById('setWebToolsBackend');
+    const payload = {fetch_backend:document.getElementById('setWebFetchBackend').value};
+    if(!enabled.disabled) payload.enabled = enabled.checked;
+    if(!search.disabled) payload.backend = search.value;
+    if(search.value === 'external') payload.external = readWebExternalProfile();
     if(payload.fetch_backend === 'external') payload.external_fetch = readWebFetchProfile();
     form.disabled = true;
     const r = await postJSON('/settings/web-tools', payload);

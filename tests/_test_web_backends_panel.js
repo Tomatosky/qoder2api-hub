@@ -51,6 +51,8 @@ const data={web_tools:true,web_tools_backend:'external',web_tools_external:{prov
   check('non-external backend hides service fields',elements.setWebExternal.style.display==='none');
   await api.save();
   check('non-external save omits unrelated service drafts',!Object.hasOwn(requests.at(-1).payload,'external'));
+  check('locked search and enable fields are omitted on save',
+    !Object.hasOwn(requests.at(-1).payload,'backend') && !Object.hasOwn(requests.at(-1).payload,'enabled'));
   api.render({...data,web_tools_backend:'local',web_fetch_backend:'external',web_fetch_external:{
     endpoint:'http://fetcher:8080/fetch', method:'POST', url_field:'url', text_path:'data.markdown', api_key_set:true
   }});

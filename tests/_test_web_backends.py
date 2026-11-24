@@ -271,6 +271,53 @@ class WebBackendTests(unittest.TestCase):
             self.assertFalse(result["ok"])
         self.assertEqual([r["path"] for r in self.search_server.requests], ["/fetch", "/redirect"])
 
+    def test_external_fetch_requires_reported_final_url(self):
+        profile = {"endpoint": "http://fetcher:8080/fetch"}
+        url = "https://example.com/reference"
+        with mock.patch.object(W, "check_url", return_value=(True, "")), \
+                mock.patch.object(E, "_json_request", return_value={"text": "Public article"}) as request:
+            result = E.fetch(profile, url)
+            self.assertFalse(result["ok"])
+            self.assertNotIn("text", result)
+            request.return_value["final_url"] = url
+            self.assertTrue(E.fetch(profile, url)["ok"])
+        with self.assertRaisesRegex(ValueError, "final_url_path"):
+            E.normalize_fetch(dict(profile, final_url_path=""), ready=True)
+
+    def test_fetch_key_stays_on_same_origin_and_is_cleared_on_origin_change(self):
+        S.set_web_tools_config(self.path, {"external_fetch": {
+            "endpoint": "https://Fetcher.example:443/old", "api_key": "original-fetch-key"}})
+        S.set_web_tools_config(self.path, {"external_fetch": {"endpoint": "https://fetcher.example/new"}})
+        self.assertTrue(P.web_tools_settings_view()["web_fetch_external"]["api_key_set"])
+        cfg = S.set_web_tools_config(self.path, {"external_fetch": {"endpoint": "https://fetcher.example:8443/new"}})
+        self.assertEqual(cfg["external_fetch"]["api_key"], "")
+        cfg = S.set_web_tools_config(self.path, {"external_fetch": {
+            "endpoint": "https://different.example/fetch", "api_key": "replacement-fetch-key"}})
+        self.assertEqual(cfg["external_fetch"]["api_key"], "replacement-fetch-key")
+
+    def test_overrides_never_replace_saved_enabled_or_backend(self):
+        S.set_web_tools_config(self.path, {"enabled": False, "backend": "local"})
+        with mock.patch.dict(os.environ, {"QD_WEB_TOOLS": "on", "QD_WEB_TOOLS_BACKEND": "qoder"}):
+            with self.assertRaisesRegex(ValueError, "endpoint is required"):
+                S.set_web_tools_config(self.path, {"fetch_backend": "external"})
+            S.set_web_tools_config(self.path, {"enabled": True, "backend": "qoder", "fetch_backend": "external",
+                "external_fetch": {"endpoint": "http://fetcher:8080/fetch"}})
+            self.assertTrue(P.web_tools_enabled())
+            self.assertEqual(W.backend_name(self.path), "qoder")
+        self.assertFalse(P.web_tools_enabled())
+        self.assertEqual(W.backend_name(self.path), "local")
+        self.assertEqual(S.web_tools_config(self.path)["fetch_backend"], "external")
+
+    def test_invalid_settings_file_is_not_replaced(self):
+        from pathlib import Path
+
+        path = Path(S.settings_path(self.path))
+        for payload in (b'{"unfinished":', b'[]'):
+            path.write_bytes(payload)
+            with self.assertRaises(OSError):
+                S.set_web_tools_config(self.path, {"fetch_backend": "local"})
+            self.assertEqual(path.read_bytes(), payload)
+
     def test_fetch_validation_is_atomic_when_enabled(self):
         S.set_web_tools_config(self.path, {"enabled": True, "backend": "local"})
         before = S.load(self.path)
