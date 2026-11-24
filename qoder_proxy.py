@@ -8208,10 +8208,15 @@ def tool_echo_mode():
     return val if val in ("strict", "lenient") else TOOL_ECHO_MODE
 
 
-def anthropic_thinking_mode(key_entry=None):
+def anthropic_thinking_mode(key_entry=None, payload=None):
     """Anthropic 入口 thinking block 输出策略（issue #146）：empty | off。
 
-    优先级：1) 每 Key 覆盖  2) 面板全局设置  3) 环境变量 QD_ANTHROPIC_THINKING  4) off。
+    优先级：1) 每 Key 覆盖  2) 面板全局设置  3) 环境变量 QD_ANTHROPIC_THINKING
+    4) 请求显式要求思考 -> empty  5) off。
+
+    第 4 条是「请求驱动」：客户端带了 thinking:enabled/adaptive 或
+    output_config.effort 时，按它的意图输出空签名 thinking block；显式
+    off（Key/面板/环境变量）仍然优先，便于强制关闭。
     """
     if isinstance(key_entry, dict):
         key_mode = str(key_entry.get("anthropic_thinking") or "").strip().lower()
@@ -8224,7 +8229,12 @@ def anthropic_thinking_mode(key_entry=None):
     if panel_mode in ("empty", "off"):
         return panel_mode
     env_mode = (os.environ.get("QD_ANTHROPIC_THINKING") or "").strip().lower()
-    return env_mode if env_mode in ("empty",) else "off"
+    if env_mode in ("empty", "off"):
+        return env_mode
+    if payload is not None and qoder_anthropic.wants_thinking(payload):
+        return "empty"
+    return "off"
+
 
 def _neutralize_auth_codes(text):
     """把文字里独立出现的 401/403 改写成 HTTP_401/HTTP_403（issue #137）。"""
@@ -9970,9 +9980,10 @@ def iter_inner_sse(resp, holder=None):
                 note_queue_observation(scope, success=True)
                 if holder is not None:
                     holder["_upstream_finished"] = True
-            if holder is not None and inner.get("usage") \
-                    and not holder.get("usage"):
-                holder["usage"] = inner["usage"]
+            inner_usage = inner.get("usage")
+            if (holder is not None and isinstance(inner_usage, dict)
+                    and inner_usage and not holder.get("usage")):
+                holder["usage"] = inner_usage
         cleaned = clean_chunk(body)
         if not cleaned:
             continue
@@ -10012,10 +10023,9 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None,
             model = chunk["model"]
         if chunk.get("created"):
             created = chunk["created"]
-        if chunk.get("usage"):
-            usage = chunk["usage"]
-            if holder is not None:
-                holder["usage"] = usage
+        chunk_usage = chunk.get("usage")
+        if isinstance(chunk_usage, dict) and chunk_usage:
+            usage = holder["usage"] = chunk_usage
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             reason = choice.get("finish_reason")
@@ -13855,6 +13865,10 @@ class Handler(BaseHTTPRequestHandler):
         model_key = resolve_model_key(model_hint, realm=req_realm)
         # 传 supported 档位表，否则 effort_from_anthropic 会静默丢弃思考档位。
         meta = catalog_meta_for(model_key, req_realm)
+        # issue #146 的「请求驱动」：客户端显式要思考才输出（空签名）thinking；同一请
+        # 求的流式/非流式必须用同一个决策，避免两条出口行为分叉。
+        thinking_mode = anthropic_thinking_mode(
+            getattr(self, "key_entry", None), payload)
         chat_req = qoder_anthropic.messages_to_chat(
             payload, catalog_meta=meta, supported=supported_efforts(meta))
         self._apply_context_header(chat_req)  # issue #106
@@ -13878,7 +13892,7 @@ class Handler(BaseHTTPRequestHandler):
             messages=chat_req.get("messages"))
         if web_request and web_request.limits:
             return self._handle_web_tools(path, payload, set(web_request.limits),
-                                          anthropic=(web_request, chat_req))
+                                          anthropic=(web_request, chat_req, thinking_mode))
         holder = {"usage": None,
                   "allowed_names": _tool_names_from_payload(chat_req)}
         log("anthropic: model=%s stream=%s msgs=%d effort=%r structured=%s"
@@ -13995,7 +14009,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._sse_write)
                     for frame in qoder_anthropic.stream_anthropic_events(
                             inner, model, holder,
-                            thinking_mode_override=anthropic_thinking_mode(getattr(self, "key_entry", None))):
+                            thinking_mode_override=thinking_mode):
                         if first_ms is None:
                             first_ms = int((time.time() - t_start) * 1000)
                         self._sse_write(frame)
@@ -14058,8 +14072,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             result = qoder_anthropic.chat_to_messages(
-                chat_obj, model=model,
-                thinking_mode_override=anthropic_thinking_mode(getattr(self, "key_entry", None)))
+                chat_obj, model=model, thinking_mode_override=thinking_mode)
             record_usage(model, chat_obj.get("usage"), stream=False,
                          elapsed_ms=wall, fp=fp, account=account.uid,
                          effort=usage_ctx.get("effort"),
@@ -14072,7 +14085,7 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_web_tools(self, path, payload, names, anthropic=None):
         """Execute declared hosted web tools without client-side orchestration."""
         is_responses = path.endswith("/responses")
-        web_request, anthropic_chat = anthropic or (None, None)
+        web_request, anthropic_chat, thinking_mode = anthropic or (None, None, None)
         want_stream = bool(payload.get("stream"))
         names = set(names)
         # Responses web_search includes opening sources, not just a query.
@@ -14159,7 +14172,7 @@ class Handler(BaseHTTPRequestHandler):
             web_output.start()
         elif web_request:
             web_output = qoder_anthropic_web.WebOutput(
-                web_request, model, anthropic_thinking_mode(getattr(self, "key_entry", None)),
+                web_request, model, thinking_mode,
                 self._sse_begin if want_stream else None, self._sse_write if want_stream else None)
 
         def fail(status, message, kind="upstream_error"):
