@@ -16,6 +16,7 @@
 python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
                       [--accounts-dir DIR] [--usage-dir DIR]
                       [--panel-password PWD] [--system-prompt TEXT] [--pid-file FILE]
+python qoder_proxy.py [--accounts-dir DIR] (--set-panel-password | --backup-accounts FILE | --import-local-credential FILE)
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -26,7 +27,10 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 | `--api-key` | `$API_KEY` / `$QD_PROXY_KEY` | 启动级 API Key。看板里一旦配置了 Key，这个参数就不再生效 |
 | `--accounts-dir` | `$ACCOUNTS_DIR` 或 `./accounts` | 账号与设置目录 |
 | `--usage-dir` | `$QD_PROXY_USAGE_DIR` 或 `./usage` | 用量流水目录 |
-| `--panel-password` | — | 启动时设置面板密码 |
+| `--panel-password` | — | 启动时显式设置面板密码；优先使用交互方式，避免参数被记录 |
+| `--set-panel-password` | — | 在服务器终端交互设置或重置面板密码，完成后退出 |
+| `--backup-accounts FILE` | — | 离线写入可恢复账号备份，要求新文件且在账号目录之外 |
+| `--import-local-credential FILE` | — | 终端导入指定文件，配合 `--credential-realm cn/intl` 和 `--credential-format cli/app` |
 | `--system-prompt` | — | 请求没有提供系统提示词时，使用此参数的内容 |
 | `--pid-file` | — | 把进程 PID 写入该文件，退出时删除（`stop-qoder-proxy.bat` 依赖它） |
 
@@ -38,10 +42,9 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 
 ## 面板密码
 
-- 打开看板需要输入面板密码，默认是 `admin`。它和 API Key 互相独立
-- 密码以 PBKDF2-SHA256 摘要保存，不存明文
-- 登录会话有效期 7 天，网关重启后依然有效；修改密码会让所有已登录的浏览器下线
-- 面板还在用默认密码时，看板不会显示明文 API Key。请先修改密码
+- 面板没有可用的默认密码。新安装或旧安装未设置自定义密码时，所有网络接口上的面板登录均锁定；推理 API 独立，不受面板首设影响。
+- 首设或忘记密码时，在服务器终端运行 `python qoder_proxy.py --set-panel-password`；Docker 下运行 `docker compose exec qoder-proxy python qoder_proxy.py --set-panel-password`。若使用自定义账号目录，请传入同一个 `--accounts-dir`。新密码至少 12 字符，不能使用旧版默认口令。
+- 密码以 PBKDF2-SHA256 摘要保存。已有自定义密码保留；升级后旧会话需重新登录。之后的会话有效期为 7 天，同一密码版本的会话可跨重启，改密码会立即使旧会话失效。
 
 ## API Key 与出口绑定
 
@@ -56,12 +59,8 @@ python qoder_proxy.py [--host HOST] [--port PORT] [--lan] [--api-key KEY]
 
 **鉴权规则：**
 
-- 只要有任何一个启用中的 Key（或启动时指定了 `--api-key`），`/v1/*` 就必须带 Key
-- 否则不需要 Key，适用于本机单用户场景
-- Key 可以通过以下任一方式传入：
-  - `Authorization: Bearer <key>`
-  - `x-api-key: <key>`（Anthropic 客户端使用）
-  - 查询参数 `?key=<key>`
+- 非回环监听始终要求鉴权，即使旧配置关闭了鉴权；没有可用 Key 时请求会被拒绝。仅回环监听可在未配置 Key 时免鉴权。
+- 使用请求头 `Authorization: Bearer <key>` 或 `x-api-key: <key>`（Anthropic 客户端使用）；不支持 URL 中的 Key。
 
 ## 模型闸门
 

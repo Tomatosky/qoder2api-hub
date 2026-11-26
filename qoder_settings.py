@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import threading
+import tempfile
 import time
 from pathlib import Path
 
@@ -56,57 +57,87 @@ def save(accounts_dir, data):
         base = Path(accounts_dir).resolve()
         base.mkdir(parents=True, exist_ok=True)
         path = base / "settings.json"
-        tmp = base / "settings.json.tmp"
-        if not (path.is_relative_to(base) and tmp.is_relative_to(base)):
-            raise ValueError("path escapes base directory")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, path)
+        fd, tmp = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=str(base))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
         return str(path)
 
 
-def panel_password_is_default(accounts_dir):
+PANEL_PASSWORD_MIN_LENGTH = 12
+
+
+def _panel_password_record(accounts_dir):
     data = load(accounts_dir)
-    if not data.get("panel_password_hash"):
-        return True
-    return data.get("panel_password_default") is True
+    return _parse_panel_password_record(data)
+
+
+def _parse_panel_password_record(data):
+    stored = data.get("panel_password_hash")
+    salt = data.get("panel_password_salt")
+    rounds = data.get("panel_password_rounds", PBKDF2_ROUNDS)
+    if (data.get("panel_password_default") is True
+            or not isinstance(stored, str) or not re.fullmatch(r"[0-9a-f]{64}", stored)
+            or not isinstance(salt, str) or not re.fullmatch(r"[0-9a-f]{32}", salt)
+            or type(rounds) is not int or not 1 <= rounds <= 2_000_000):
+        return None
+    return stored, salt, rounds
+
+
+def panel_password_binding(accounts_dir):
+    record = _panel_password_record(accounts_dir)
+    return record[0] if record else ""
+
+
+def panel_password_is_default(accounts_dir):
+    """Legacy name: true if the panel is locked pending local provisioning."""
+    return not panel_password_binding(accounts_dir)
+
+
+def verified_panel_password_binding(accounts_dir, password):
+    """Return the exact credential revision that was verified, or empty on failure."""
+    if (not isinstance(password, str) or len(password) > 1024
+            or not password.strip() or password.strip().casefold() == DEFAULT_PANEL_PASSWORD):
+        return ""
+    record = _panel_password_record(accounts_dir)
+    if not record:
+        return ""
+    stored, salt, rounds = record
+    try:
+        given = _digest(password, salt, rounds)
+    except (UnicodeError, ValueError):
+        return ""
+    return stored if hmac.compare_digest(given, stored) else ""
 
 
 def verify_panel_password(accounts_dir, password):
-    """True when `password` opens the web panel."""
-    password = password or ""
-    data = load(accounts_dir)
-    stored = data.get("panel_password_hash")
-    if not stored:
-        return password == DEFAULT_PANEL_PASSWORD
-    if data.get("panel_password_default") is True:
-        return password == DEFAULT_PANEL_PASSWORD
-    salt = data.get("panel_password_salt")
-    if not salt:
-        return False
-    rounds = int(data.get("panel_password_rounds") or PBKDF2_ROUNDS)
+    return bool(verified_panel_password_binding(accounts_dir, password))
+
+
+def set_panel_password(accounts_dir, password, *, expected_binding=None):
+    if (not isinstance(password, str) or not PANEL_PASSWORD_MIN_LENGTH <= len(password) <= 1024
+            or not password.strip() or password.strip().casefold() == DEFAULT_PANEL_PASSWORD):
+        raise ValueError("panel password must be non-default and 12–1024 characters long")
     try:
-        given = _digest(password, salt, rounds)
-    except Exception:
-        return False
-    return hmac.compare_digest(given, stored)
-
-
-def set_panel_password(accounts_dir, password):
+        salt = secrets.token_hex(16)
+        digest = _digest(password, salt)
+    except UnicodeError as exc:
+        raise ValueError("invalid characters in panel password") from exc
     with _lock:
-        data = load(accounts_dir)
-        if password == DEFAULT_PANEL_PASSWORD:
-            data.pop("panel_password_salt", None)
-            data.pop("panel_password_rounds", None)
-            data["panel_password_hash"] = ""
-            data["panel_password_default"] = True
-        else:
-            salt = secrets.token_hex(16)
-            data["panel_password_salt"] = salt
-            data["panel_password_rounds"] = PBKDF2_ROUNDS
-            data["panel_password_hash"] = _digest(password, salt)
-            data["panel_password_default"] = False
+        data = _load_for_update(accounts_dir)
+        record = _parse_panel_password_record(data)
+        if expected_binding is not None and (not record or expected_binding != record[0]):
+            raise ValueError("panel password changed; sign in again")
+        data.update(panel_password_salt=salt, panel_password_rounds=PBKDF2_ROUNDS,
+                    panel_password_hash=digest, panel_password_default=False)
         save(accounts_dir, data)
+    return digest
 
 
 def api_key_override(accounts_dir):
@@ -135,7 +166,7 @@ def ensure_launcher_key(accounts_dir):
     this run minted a fresh credential.
     """
     with _lock:
-        data = load(accounts_dir)
+        data = _load_for_update(accounts_dir)
         existing = str(data.get("launcher_key") or "").strip()
         if existing:
             return existing, False
@@ -349,14 +380,15 @@ def match_api_key(accounts_dir, supplied, extra_keys=()):
     supplied = (supplied or "").strip()
     if not supplied:
         return None
+    supplied = supplied.encode("utf-8", "surrogatepass")
     for entry in api_keys(accounts_dir):
-        if entry["enabled"] and hmac.compare_digest(supplied, entry["key"]):
+        if entry["enabled"] and hmac.compare_digest(supplied, entry["key"].encode("utf-8", "surrogatepass")):
             out = dict(entry)
             out["source"] = "panel"
             return out
     for candidate in extra_keys:
         candidate = (candidate or "").strip()
-        if candidate and hmac.compare_digest(supplied, candidate):
+        if candidate and hmac.compare_digest(supplied, candidate.encode("utf-8", "surrogatepass")):
             return {
                 "id": "launcher",
                 "name": "启动参数",
@@ -592,29 +624,6 @@ PANEL_SECRET_KEY = "panel_session_secret"
 _SAFE_TOKEN_PART = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-def _settings_is_rewritable(accounts_dir):
-    """settings.json 是否「不存在、或现有内容可解析」。
-
-    不存在 -> True（首次安装，可以新建）；
-    存在且能 json.load -> True（含合法的空对象）；
-    存在但解析失败 -> False。
-
-    为什么要分开：`load()` 把「文件不存在」与「解析失败/瞬时读错」都吐成 {}，
-    而 save() 写的是**整个 dict**。拿一个读失败得到的 {} 去 save，就会把
-    panel_password_hash / api_keys / limits 全部抹掉——面板回到默认口令 admin，
-    所有 API Key 失效。一次瞬时 EIO 就能造成这种不可逆破坏。
-    """
-    path = settings_path(accounts_dir)
-    if not os.path.exists(path):
-        return True
-    try:
-        with open(path, encoding="utf-8") as fh:
-            json.load(fh)
-        return True
-    except Exception:
-        return False
-
-
 def panel_session_secret(accounts_dir):
     """面板会话签名密钥：首次生成后持久化，重启后旧 token 仍能验证。
 
@@ -627,9 +636,7 @@ def panel_session_secret(accounts_dir):
     临时密钥）：宁可面板多登一次，也不能把密码哈希和 API Key 一起抹掉。
     """
     with _lock:
-        if not _settings_is_rewritable(accounts_dir):
-            raise OSError("settings.json unreadable; refusing to overwrite it")
-        data = load(accounts_dir)
+        data = _load_for_update(accounts_dir)
         secret = str(data.get(PANEL_SECRET_KEY) or "")
         if len(secret) >= 32:
             return secret
@@ -643,8 +650,8 @@ class PanelSessions(object):
     """签名式面板会话 token，**重启后仍然有效**。
 
     token 自校验，服务端不存会话表：`<过期秒>.<nonce>.<hmac_sha256>`。
-    验证时用持久化密钥重算签名，所以网关重启/升级不强制重新登录；
-    revoke_all() 换密钥即让所有浏览器的旧 token 一次性失效（改密码时用）。
+    验证时使用持久化密钥和当前密码摘要。同一密码版本跨重启有效；
+    更换密码或签名密钥都会令旧会话失效。旧版签名格式不再接受。
 
     已知取舍：revoke(token) 的黑名单只在**本进程**生效。因此「退出登录」端点
     改调 revoke_all()（换密钥）——否则重启后那个已退出的 token 会复活到 TTL
@@ -682,17 +689,21 @@ class PanelSessions(object):
                     self._ephemeral = True
             return self._secret
 
-    def _sign(self, expiry, nonce):
-        return hmac.new(self._key().encode("utf-8"),
-                        ("%d.%s" % (expiry, nonce)).encode("utf-8"),
+    def _sign(self, expiry, nonce, binding=None):
+        if binding is None:
+            binding = panel_password_binding(self._accounts_dir())
+        # Domain change deliberately invalidates all sessions issued before
+        # the credential-binding policy, including legacy default sessions.
+        message = "panel-v2:%s:%d.%s" % (binding, expiry, nonce)
+        return hmac.new(self._key().encode("utf-8"), message.encode("utf-8"),
                         hashlib.sha256).hexdigest()
 
-    def create(self):
+    def create(self, binding=None):
         expiry = int(time.time()) + self.ttl
         nonce = secrets.token_urlsafe(12)
-        return "%d.%s.%s" % (expiry, nonce, self._sign(expiry, nonce))
+        return "%d.%s.%s" % (expiry, nonce, self._sign(expiry, nonce, binding))
 
-    def valid(self, token):
+    def valid(self, token, binding=None):
         if not token:
             return False
         parts = str(token).split(".")
@@ -711,7 +722,7 @@ class PanelSessions(object):
         expiry = int(expiry_s)
         if expiry < time.time():
             return False
-        if not hmac.compare_digest(signature, self._sign(expiry, nonce)):
+        if not hmac.compare_digest(signature, self._sign(expiry, nonce, binding)):
             return False
         with self._lock:
             return token not in self._revoked
@@ -739,9 +750,10 @@ class PanelSessions(object):
             self._secret = new_secret
             self._revoked.clear()
         try:
-            data = load(accounts_dir)
-            data[PANEL_SECRET_KEY] = new_secret
-            save(accounts_dir, data)
+            with _lock:
+                data = _load_for_update(accounts_dir)
+                data[PANEL_SECRET_KEY] = new_secret
+                save(accounts_dir, data)
         except Exception:
             # 写盘失败：本进程已换密钥（旧 token 立即作废）；重启后读回旧密钥
             # 会让旧 token 复活，但这已经优于「改密码却踢不掉任何会话」。
