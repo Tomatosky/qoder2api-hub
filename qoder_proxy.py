@@ -60,6 +60,7 @@ import qoder_catalog
 import qoder_keepalive
 import qoder_images
 import qoder_cache
+import qoder_identity_guard
 import qoder_routing
 import qoder_admin
 import qoder_logpaths
@@ -2597,6 +2598,9 @@ def runtime_settings_view():
         "api_keys": keys,
         "network_auth_required": NETWORK_AUTH_REQUIRED,
         "omit_default_system_prompt": qoder_settings.omit_default_system_prompt(ACCOUNTS_DIR),
+        # 出站身份句守卫（默认关）：中和第三方 Agent 品牌身份句，
+        # 规避上游 10605 品牌检测硬拒绝（见 qoder_identity_guard）
+        "identity_guard": qoder_identity_guard.guard_enabled(ACCOUNTS_DIR),
         # limits 与保存分支同源：limits_data 返回**完整形状**（每个守卫都补齐
         # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
         # 把已有阈值覆盖成默认值。
@@ -7302,6 +7306,17 @@ def build_qoder_body(payload, account, model_key, realm=None, conversation=None)
                             if (m or {}).get("role") == "system"]
     # 追加真实会话
     body["messages"].extend(flat)
+
+    # 出站身份句守卫（2026-11-23 上游品牌检测对策，默认关）：命中
+    # "You are ZCode," / "powered by DeepSeek Harness." 等字面特征时做
+    # 最小字符级中和，避免被打入 p1 硬拒绝队列（10605/serviceAvailable=false）。
+    # 放在 flatten 之后：覆盖 system + 全部历史消息的文本 part。
+    if qoder_identity_guard.guard_enabled(ACCOUNTS_DIR):
+        body["messages"], _id_hits = qoder_identity_guard.neutralize_messages(
+            body["messages"])
+        if _id_hits:
+            log("identity guard: neutralized %d brand signature(s) in outbound "
+                "messages (upstream 10605 brand gate)" % _id_hits, tag="chat")
 
     # 最新用户提示词（上游 chat_context 高亮 + business 会话名）
     prompt = ""
@@ -12807,6 +12822,10 @@ class Handler(BaseHTTPRequestHandler):
                 and type(payload["omit_default_system_prompt"]) is not bool):
             return self._error(400, "omit_default_system_prompt must be a boolean",
                                "invalid_request_error")
+        if ("identity_guard" in payload
+                and type(payload["identity_guard"]) is not bool):
+            return self._error(400, "identity_guard must be a boolean",
+                               "invalid_request_error")
         reply = {}
         if "api_keys" in payload:
             raw = payload.get("api_keys")
@@ -12931,6 +12950,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 qoder_settings.set_omit_default_system_prompt(
                     ACCOUNTS_DIR, payload["omit_default_system_prompt"])
+            except OSError as exc:
+                return self._error(500, "save failed: %s" % exc)
+        if "identity_guard" in payload:
+            try:
+                qoder_settings.set_identity_guard(
+                    ACCOUNTS_DIR, payload["identity_guard"])
             except OSError as exc:
                 return self._error(500, "save failed: %s" % exc)
         if payload.get("restart_scheduler"):

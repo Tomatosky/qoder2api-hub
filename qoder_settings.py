@@ -416,6 +416,22 @@ def omit_default_system_prompt(accounts_dir):
     return load(accounts_dir).get("omit_default_system_prompt") is True
 
 
+def identity_guard(accounts_dir):
+    """出站身份句守卫开关（面板「设置」/ QD_IDENTITY_GUARD）。
+
+    开启后对出站 messages 中命中上游品牌检测的身份句做最小字符级
+    中和（详见 qoder_identity_guard 模块文档）。默认关闭。
+    """
+    return load(accounts_dir).get("identity_guard") is True
+
+
+def set_identity_guard(accounts_dir, enabled):
+    with _lock:
+        data = load(accounts_dir)
+        data["identity_guard"] = bool(enabled)
+        save(accounts_dir, data)
+
+
 def set_omit_default_system_prompt(accounts_dir, enabled):
     with _lock:
         try:

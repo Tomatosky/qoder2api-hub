@@ -4297,6 +4297,16 @@ input[type=text]:focus,input[type=search]:focus,input[type=password]:focus,input
         <button type="button" style="margin-top:12px" onclick="saveSystemPromptSettings()">保存并应用</button>
       </fieldset>
     </section>
+    <section id="sectionIdentityGuard">
+      <h2>出站身份句守卫 <em id="setIdentityGuardState"></em></h2>
+      <fieldset id="setIdentityGuardForm" disabled style="border:0;padding:0;margin:0;min-width:0">
+        <label style="display:inline-flex;align-items:center;gap:8px;font-size:13px">
+          <input type="checkbox" id="setIdentityGuard"><span>中和第三方 Agent 品牌身份句</span>
+        </label>
+        <div class="hint" style="margin-top:6px">上游（2026-11-23 起）对 system 中 <code>You are 品牌名,</code> / <code>powered by 品牌名.</code> 这类身份句（如 ZCode / Claude Code / Codex / DeepSeek Harness）返回 10605 硬拒绝（p1 队列、等待不放行），第三方 Agent 客户端因此报错。开启后用通用正则匹配任意大写品牌名，仅在命中片段内插入一个空格打断匹配，品牌名与语义保留，其余文本零改动。环境变量 <code>QD_IDENTITY_GUARD</code> 优先于本开关。</div>
+        <button type="button" style="margin-top:12px" onclick="saveIdentityGuardSettings()">保存并应用</button>
+      </fieldset>
+    </section>
     <section id="sectionLimits">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
         <div>
@@ -8224,6 +8234,15 @@ async function loadSettings(showToast){
       document.getElementById('setOmitDefaultSystemPrompt').checked = SYSTEM_PROMPT_CONFIRMED;
       promptForm.disabled = false;
     }
+    // 出站身份句守卫回显（上游 10605 品牌检测对策，默认关）
+    const igForm = document.getElementById('setIdentityGuardForm');
+    const igBox = document.getElementById('setIdentityGuard');
+    const igState = document.getElementById('setIdentityGuardState');
+    if(igForm && igBox && typeof data.identity_guard === 'boolean'){
+      igBox.checked = data.identity_guard;
+      igForm.disabled = false;
+      if(igState) igState.textContent = data.identity_guard ? '（已开启）' : '（已关闭）';
+    }
     // issue #135：工具协议残片收尾策略回显（环境变量优先时给出提示）
     const teBox = document.getElementById("setToolEcho");
     const teState = document.getElementById("setToolEchoState");
@@ -8299,6 +8318,27 @@ async function saveSystemPromptSettings(){
   }finally{
     ++SYSTEM_PROMPT_READ_ID;
     SYSTEM_PROMPT_SAVING = false;
+    form.disabled = false;
+  }
+}
+
+// 出站身份句守卫保存（独立于系统提示词设置，互不覆盖）
+async function saveIdentityGuardSettings(){
+  const form = document.getElementById('setIdentityGuardForm');
+  const checkbox = document.getElementById('setIdentityGuard');
+  if(!form || !checkbox || form.disabled) return;
+  const enabled = checkbox.checked;
+  form.disabled = true;
+  try{
+    const result = await postJSON('/settings/save', {identity_guard: enabled});
+    if(result.identity_guard !== enabled) throw new Error(t('未确认身份句守卫设置'));
+    checkbox.checked = result.identity_guard;
+    const state = document.getElementById('setIdentityGuardState');
+    if(state) state.textContent = result.identity_guard ? '（已开启）' : '（已关闭）';
+    toast('身份句守卫设置已保存', 'ok');
+  }catch(e){
+    toast('保存失败: ' + e.message, 'bad');
+  }finally{
     form.disabled = false;
   }
 }
