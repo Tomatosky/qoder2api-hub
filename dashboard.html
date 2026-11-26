@@ -8240,8 +8240,12 @@ async function loadSettings(showToast){
     const igState = document.getElementById('setIdentityGuardState');
     if(igForm && igBox && typeof data.identity_guard === 'boolean'){
       igBox.checked = data.identity_guard;
-      igForm.disabled = false;
-      if(igState) igState.textContent = data.identity_guard ? '（已开启）' : '（已关闭）';
+      // QD_IDENTITY_GUARD 固定时，面板开关保存了也不生效：只读展示，避免被当成保存失败
+      const igPinned = data.identity_guard_env === 'on' || data.identity_guard_env === 'off';
+      igForm.disabled = igPinned;
+      if(igState) igState.textContent = igPinned
+        ? (data.identity_guard ? '（由环境变量固定为开启）' : '（由环境变量固定为关闭）')
+        : (data.identity_guard ? '（已开启）' : '（已关闭）');
     }
     // issue #135：工具协议残片收尾策略回显（环境变量优先时给出提示）
     const teBox = document.getElementById("setToolEcho");

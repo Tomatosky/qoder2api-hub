@@ -2601,6 +2601,8 @@ def runtime_settings_view():
         # 出站身份句守卫（默认关）：中和第三方 Agent 品牌身份句，
         # 规避上游 10605 品牌检测硬拒绝（见 qoder_identity_guard）
         "identity_guard": qoder_identity_guard.guard_enabled(ACCOUNTS_DIR),
+        # "on" / "off" when QD_IDENTITY_GUARD pins the switch ("" = panel-controlled)
+        "identity_guard_env": qoder_identity_guard.env_override(),
         # limits 与保存分支同源：limits_data 返回**完整形状**（每个守卫都补齐
         # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
         # 把已有阈值覆盖成默认值。
@@ -7318,9 +7320,11 @@ def build_qoder_body(payload, account, model_key, realm=None, conversation=None)
             log("identity guard: neutralized %d brand signature(s) in outbound "
                 "messages (upstream 10605 brand gate)" % _id_hits, tag="chat")
 
-    # 最新用户提示词（上游 chat_context 高亮 + business 会话名）
+    # 最新用户提示词（上游 chat_context 高亮 + business 会话名）。
+    # 必须从守卫处理后的 body["messages"] 取，不能回读 flat：chat_context 的
+    # 两个文本副本随同一个请求出站，否则最新一条用户消息里的身份句会以原文漏出。
     prompt = ""
-    for m in reversed(flat):
+    for m in reversed(body["messages"]):
         if m["role"] == "user" and m.get("content"):
             _c = m["content"]
             if isinstance(_c, list):
@@ -12812,6 +12816,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_settings_save(self):
         """Persist panel-managed settings from the web settings tab."""
+        try:
+            return self._save_settings_payload()
+        except OSError as exc:
+            # A failed read is not a fresh install: the file was left untouched.
+            return self._error(500, "settings could not be read or saved: %s" % exc)
+
+    def _save_settings_payload(self):
         payload = self._payload_or_error()
         if payload is None:
             return

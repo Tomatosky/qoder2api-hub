@@ -116,6 +116,16 @@ with tempfile.TemporaryDirectory() as directory:
             for query in ("secrets=1", "secrets=true", "secrets=", "secrets=0&secrets=yes&download=1"):
                 status, body, _ = request(server, "/accounts/export?" + query, token=token)
                 check("HTTP credential backup options fail closed", status == 403 and "accounts" not in body)
+            status, body, _ = request(server, "/settings/save", {"identity_guard": True}, token=token)
+            check("panel switches the identity guard and reports an unpinned switch",
+                  status == 200 and body.get("identity_guard") is True
+                  and body.get("identity_guard_env") == "" and S.identity_guard(store))
+            with mock.patch.dict(os.environ, {"QD_IDENTITY_GUARD": "1"}):
+                status, body, _ = request(server, "/settings/save", {"identity_guard": False}, token=token)
+                check("pinned switch is reported instead of a false confirmation",
+                      status == 200 and body.get("identity_guard") is True
+                      and body.get("identity_guard_env") == "on")
+            S.set_identity_guard(store, False)
             status, _, _ = request(server, "/panel/password", {"current": "fixture-panel-password", "new": "admin"}, token=token)
             check("password cannot be reset to the legacy default", status == 400 and S.PanelSessions(store).valid(token))
             status, body, _ = request(server, "/panel/password",
@@ -151,6 +161,81 @@ with tempfile.TemporaryDirectory() as directory:
               and not S.verify_panel_password(store, "fixture-replacement-01"))
     else:
         check("do not overwrite unreadable settings", False)
+
+    # ---- every settings write: a failed or invalid read is never a fresh install ----
+    all_setters = [
+        ("api_key", lambda: S.set_api_key(store, "fixture-key-1")),
+        ("api_keys", lambda: S.set_api_keys(store, [{"key": "fixture-key-2", "name": "fixture"}])),
+        ("model_context", lambda: S.set_model_context(store, "fixture-model", "1M")),
+        ("tool_echo_mode", lambda: S.set_tool_echo_mode(store, "strict")),
+        ("anthropic_thinking", lambda: S.set_anthropic_thinking(store, "off")),
+        ("auth_disabled", lambda: S.set_auth_disabled(store, True)),
+        ("identity_guard", lambda: S.set_identity_guard(store, True)),
+        ("banned_models", lambda: S.set_banned_models(store, "fixture-model")),
+        ("limit", lambda: S.set_limit(store, "reserve_credits", "global", 5)),
+        ("omit_default_system_prompt", lambda: S.set_omit_default_system_prompt(store, True)),
+    ]
+    truncated = '{"panel_password_hash": "deadbeef", "api_keys": [{"id": "keep"}'
+    for name, write in all_setters:
+        target.write_text(truncated, encoding="utf-8")
+        try:
+            write()
+        except OSError:
+            check("invalid settings refuse write: " + name, target.read_text(encoding="utf-8") == truncated)
+        else:
+            check("invalid settings refuse write: " + name, False)
+
+    baseline = {"launcher_key": "fixture-launcher", "api_keys": [{"id": "keep", "key": "fixture-key-keep"}],
+                "identity_guard": False}
+    S.save(store, baseline)
+    real_open = open
+
+    def locked_settings(file, *args, **kwargs):
+        if os.path.abspath(str(file)) == os.path.abspath(str(target)):
+            raise PermissionError("fixture: settings file is busy")
+        return real_open(file, *args, **kwargs)
+
+    for name, write in all_setters:
+        try:
+            with mock.patch.object(S, "open", create=True, side_effect=locked_settings):
+                write()
+        except OSError:
+            kept = S.load(store)
+            check("transient read error keeps settings: " + name,
+                  kept.get("launcher_key") == "fixture-launcher"
+                  and kept["api_keys"][0]["id"] == "keep" and kept.get("identity_guard") is False)
+        else:
+            check("transient read error keeps settings: " + name, False)
+
+    target.write_bytes("\ufeff".encode("utf-8") + json.dumps(baseline).encode("utf-8"))
+    S.set_identity_guard(store, True)
+    kept = S.load(store)
+    check("UTF-8 BOM settings stay readable and intact",
+          kept.get("launcher_key") == "fixture-launcher" and kept.get("identity_guard") is True
+          and kept["api_keys"][0]["id"] == "keep")
+    target.write_text("", encoding="utf-8")
+    S.set_identity_guard(store, False)
+    check("empty settings file is treated as a fresh install", S.load(store) == {"identity_guard": False})
+
+    # ---- HTTP layer: an unreadable file yields an error response, never a silent reset ----
+    target.write_text("{broken", encoding="utf-8")
+    with mock.patch.multiple(P, ACCOUNTS_DIR=store, PANEL=panel, POOL=pool, API_KEY=""), \
+            mock.patch.object(S, "panel_password_binding", return_value="a" * 64), \
+            mock.patch.object(panel, "valid", return_value=True):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            for body in ({"identity_guard": True}, {"api_keys": []}, {"auth_disabled": True},
+                         {"api_key": ""}, {"limits": {"reserve_credits": {"global": 9}}}):
+                status, reply, _ = request(server, "/settings/save", body, token="fixture-session")
+                check("settings save fails loudly on an unreadable file: %s" % sorted(body),
+                      status == 500 and "error" in reply
+                      and target.read_text(encoding="utf-8") == "{broken", (status, reply))
+        finally:
+            server.shutdown()
+            worker.join(timeout=5)
+            server.server_close()
 
 with tempfile.TemporaryDirectory() as directory:
     root = Path(directory)

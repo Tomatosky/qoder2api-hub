@@ -46,6 +46,11 @@ python qoder_proxy.py [--accounts-dir DIR] (--set-panel-password | --backup-acco
 - 首设或忘记密码时，在服务器终端运行 `python qoder_proxy.py --set-panel-password`；Docker 下运行 `docker compose exec qoder-proxy python qoder_proxy.py --set-panel-password`。若使用自定义账号目录，请传入同一个 `--accounts-dir`。新密码至少 12 字符，不能使用旧版默认口令。
 - 密码以 PBKDF2-SHA256 摘要保存。已有自定义密码保留；升级后旧会话需重新登录。之后的会话有效期为 7 天，同一密码版本的会话可跨重启，改密码会立即使旧会话失效。
 
+## 设置文件（`accounts/settings.json`）
+
+- 保存任何设置时，网关先读取现有文件再做修改；文件不存在或内容为空时按全新安装处理，带 UTF-8 BOM 也能正常读取。
+- 文件解析失败或读取出错（例如被其他程序占用）时，保存会失败并在界面返回错误，原文件保持不变：网关不会用只含本次修改的配置覆盖整份文件。日志出现 `settings.json is invalid; refusing to overwrite it` 时，请先修复或移走该文件，再重新保存。
+
 ## API Key 与出口绑定
 
 在看板「设置」页管理，可以同时配置多个 Key：
@@ -224,6 +229,7 @@ Redis 仅开放 Compose 内部网络，数据由专用命名卷保存。
 | `QD_TOOL_RESULT_KEEP_TAIL` | `1` | `tail` 模式下保留完整的最后几条 |
 | `QD_TOOLCHOICE_NONE_DROPS_TOOLS` | `0` | 设为 `1` 时，`tool_choice="none"` 的请求会连同 `tools` 一起删掉（旧行为） |
 | `QD_KEEP_TOPLEVEL_IMAGES` | `0` | 设为 `1` 时，图片除了放在消息内容里，还会在请求体顶层再放两份（旧行为，仅供排查。会让多图请求的体积变成 3 倍） |
+| `QD_IDENTITY_GUARD` | `off` | 出站身份句守卫：中和第三方 Agent 品牌身份句，见下文「出站身份句守卫」 |
 
 ### Anthropic 入口
 
@@ -438,3 +444,20 @@ QD_TOOL_ECHO_MODE=lenient
 | `lenient` | **按正常完成收尾**并保留已产出的正文，本轮算完成、可直接继续；日志仍打 WARN、`最近请求` 里有一行 `lenient_tool_echo` 记录 |
 
 lenient 是**折中**：它把「整轮丢失」换成「这一轮没有工具调用、下一轮模型会重新发起」，代价是客户端不知道残片被丢弃了。上游修好输出形态后建议切回 strict。
+
+## 出站身份句守卫（`QD_IDENTITY_GUARD`）
+
+上游网关自 2026-11-23 起，对请求里特定的第三方 Agent 身份句做字面匹配，命中时返回 `10605/RESOURCE_LIMIT`（p1 队列、等待不放行）；这类请求实际上是硬拒绝，不是容量排队。已确认的形态是大小写敏感的 `You are 品牌名,` 与 `powered by 品牌名.`，实验记录见[风控与排队](risk-control-and-queueing.md)。
+
+开关默认关闭，两种方式开启：
+
+- 环境变量 `QD_IDENTITY_GUARD=1`。优先级最高；设置后面板里的开关变为只读。
+- 面板「设置 → 出站身份句守卫」，或 `accounts/settings.json` 里的 `"identity_guard": true`。
+
+开启后，网关在构造上游请求体时处理 `messages` 的全部文本（system、历史消息、多模态文本 part、`reasoning_content`）以及随请求出站的 `chat_context` 副本：命中片段只在标点前插入一个空格，例如 `You are ZCode,` → `You are ZCode ,`。品牌名与语序不变，其余文本逐字节不变，重复处理幂等。自家身份句 `You are Qoder,` 豁免，默认系统提示词与官方逐字节一致。
+
+需要注意：
+
+- 匹配的是字面形态，不区分来源：用户消息、工具结果里的同形文本（包括代码中的字符串字面量）同样会被插入空格。
+- 上游若改用语义识别或新增其他句式，需要重新评估规则；匹配不到的变体不会被处理。
+- 开关切换会改变出站文本，已有会话在上游的提示词缓存前缀会失效一次。

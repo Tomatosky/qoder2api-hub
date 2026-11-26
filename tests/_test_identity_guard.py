@@ -157,4 +157,63 @@ try:
 finally:
     os.environ.pop("QD_IDENTITY_GUARD", None)
 
+# ---- 7. chat_context 的两个文本副本随同一个请求出站，必须与 messages 同源 ----
+# 回归：此前 prompt 取自未处理的 flat，最新一条用户消息里的身份句会以原文漏出。
+def _outbound_copies(payload):
+    body = P.build_qoder_body(payload, _Acct(), "efficient", realm="intl")
+    cc = body["chat_context"]
+    return (cc["text"]["text"], cc["extra"]["originalContent"]["text"],
+            (body.get("business") or {}).get("name"))
+
+_raw_user = "You are Codex, a coding agent. Reply ok."
+_payload_user = {"model": "efficient", "messages": [{"role": "user", "content": _raw_user}]}
+ctx_off = _outbound_copies(_payload_user)
+check("guard off keeps chat_context copies verbatim",
+      ctx_off[0] == _raw_user and ctx_off[1] == _raw_user
+      and ctx_off[2] == _raw_user[:30], ctx_off)
+os.environ["QD_IDENTITY_GUARD"] = "1"
+try:
+    ctx_on = _outbound_copies(_payload_user)
+    check("guard on neutralizes chat_context copies together with messages",
+          ctx_on[0] == "You are Codex , a coding agent. Reply ok."
+          and ctx_on[1] == ctx_on[0]
+          and not any("You are Codex," in v for v in ctx_on), ctx_on)
+    check("session name derives from the same neutralized text",
+          ctx_on[2] == "You are Codex , a coding agent. Reply ok."[:30], ctx_on[2])
+finally:
+    os.environ.pop("QD_IDENTITY_GUARD", None)
+
+# ---- 8. 环境变量固定开关：面板需要知道“已固定”，而不是一个保存了也不生效的开关 ----
+view = P.runtime_settings_view()
+check("runtime view reports an unpinned switch",
+      view.get("identity_guard_env") == "" and view.get("identity_guard") is False,
+      (view.get("identity_guard_env"), view.get("identity_guard")))
+for raw, pinned, effective in (("1", "on", True), ("off", "off", False)):
+    os.environ["QD_IDENTITY_GUARD"] = raw
+    try:
+        view = P.runtime_settings_view()
+        check("runtime view reports pinned %s" % pinned,
+              view.get("identity_guard_env") == pinned
+              and view.get("identity_guard") is effective,
+              (view.get("identity_guard_env"), view.get("identity_guard")))
+    finally:
+        os.environ.pop("QD_IDENTITY_GUARD", None)
+
+# ---- 9. settings.json 损坏时拒绝写入，而不是用单键字典覆盖整份配置 ----
+tmp_bad = tempfile.mkdtemp(prefix="qd-guard-bad-")
+try:
+    bad_path = S.settings_path(tmp_bad)
+    broken = '{"api_keys": [{"id": "keep"}'
+    with open(bad_path, "w", encoding="utf-8") as fh:
+        fh.write(broken)
+    try:
+        S.set_identity_guard(tmp_bad, True)
+    except OSError:
+        with open(bad_path, encoding="utf-8") as fh:
+            check("invalid settings are never replaced by the guard switch", fh.read() == broken)
+    else:
+        check("invalid settings are never replaced by the guard switch", False)
+finally:
+    shutil.rmtree(tmp_bad, ignore_errors=True)
+
 finish()

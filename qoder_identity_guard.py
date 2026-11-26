@@ -67,16 +67,32 @@ _POWERED_RE = re.compile(r"powered by (" + _BRAND + r")\.")
 OWN_BRANDS = frozenset({"Qoder"})
 
 
+_ENV_ON = frozenset(("1", "on", "true", "yes", "enable", "enabled"))
+_ENV_OFF = frozenset(("0", "off", "false", "no", "disable", "disabled"))
+
+
+def env_override():
+    """Return "on" / "off" when QD_IDENTITY_GUARD pins the switch, else "".
+
+    The panel shows a pinned switch as read-only: saving a different value
+    would persist but never take effect, which looks like a broken save.
+    """
+    raw = str(os.environ.get("QD_IDENTITY_GUARD") or "").strip().lower()
+    if raw in _ENV_ON:
+        return "on"
+    if raw in _ENV_OFF:
+        return "off"
+    return ""
+
+
 def guard_enabled(accounts_dir=None):
     """环境变量优先，其次 settings.json；默认关闭。
 
     accounts_dir 为 None 时只看环境变量（供无面板上下文的调用点）。
     """
-    raw = str(os.environ.get("QD_IDENTITY_GUARD") or "").strip().lower()
-    if raw in ("1", "on", "true", "yes", "enable", "enabled"):
-        return True
-    if raw in ("0", "off", "false", "no", "disable", "disabled"):
-        return False
+    pinned = env_override()
+    if pinned:
+        return pinned == "on"
     if accounts_dir is None:
         return False
     try:

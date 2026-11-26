@@ -4,7 +4,7 @@
     "name": "English",
     "dir": "ltr",
     "order": 10,
-    "version": 26
+    "version": 27
   },
   "messages": {
     "国内版服务入口": "China service endpoint",
@@ -838,6 +838,17 @@
     "没有自定义系统提示词时，勾选后请求将省略 Qoder 的默认提示词。": "Omit the default Qoder prompt on requests without a custom system prompt.",
     "未确认系统提示词设置": "The gateway did not confirm the system prompt setting",
     "系统提示词设置已保存": "System prompt setting saved",
+    "未确认身份句守卫设置": "The gateway did not confirm the identity guard setting",
+    "身份句守卫设置已保存": "Identity guard setting saved",
+    "出站身份句守卫": "Outbound identity guard",
+    "中和第三方 Agent 品牌身份句": "Neutralize third-party agent brand identity sentences",
+    "上游（2026-11-23 起）对 system 中 ": "Since 2026-11-23 the upstream gateway has hard-rejected identity sentences such as ",
+    " 这类身份句（如 ZCode / Claude Code / Codex / DeepSeek Harness）返回 10605 硬拒绝（p1 队列、等待不放行），第三方 Agent 客户端因此报错。开启后用通用正则匹配任意大写品牌名，仅在命中片段内插入一个空格打断匹配，品牌名与语义保留，其余文本零改动。环境变量 ": " in system prompts (for example ZCode / Claude Code / Codex / DeepSeek Harness) with error 10605 (a p1 queue that never clears), so third-party agent clients fail. When enabled, a generic regex matches any capitalized brand name and inserts one space inside the matched fragment to break the match; the brand name and meaning are preserved and all other text is left unchanged. Environment variable ",
+    " 优先于本开关。": " takes precedence over this switch.",
+    "（已开启）": "(on)",
+    "（已关闭）": "(off)",
+    "（由环境变量固定为开启）": "(pinned on by the environment variable)",
+    "（由环境变量固定为关闭）": "(pinned off by the environment variable)",
     "高": "High",
     "低": "Low",
     "不指定 Key（管理员预览）": "No key (administrator preview)",

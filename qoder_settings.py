@@ -40,7 +40,7 @@ def load(accounts_dir):
     """Return the persisted settings, or an empty dict on a fresh install."""
     path = settings_path(accounts_dir)
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8-sig") as fh:
             data = json.load(fh)
         if isinstance(data, dict):
             return data
@@ -150,7 +150,7 @@ def api_key_override(accounts_dir):
 
 def set_api_key(accounts_dir, key):
     with _lock:
-        data = load(accounts_dir)
+        data = _load_for_update(accounts_dir)
         data["api_key"] = key or ""
         data["api_key_set"] = True
         save(accounts_dir, data)
@@ -209,27 +209,29 @@ def model_context(accounts_dir):
 
 def set_model_context(accounts_dir, model, label):
     """设置/清除单个模型的上下文档（label 空串 = 回到官方默认）。"""
-    data = load(accounts_dir)
-    cur = data.get("model_context")
-    cur = dict(cur) if isinstance(cur, dict) else {}
-    key = str(model or "").strip()
-    if not key:
-        raise ValueError("model required")
-    if label in (None, "", 0):
-        cur.pop(key, None)
-    elif isinstance(label, int) and not isinstance(label, bool):
-        if label <= 0:
-            raise ValueError("tokens must be positive")
-        cur[key] = int(label)
-    else:
-        label = str(label).strip()
-        if label.isdigit() and int(label) > 0:
+    with _lock:
+        data = _load_for_update(accounts_dir)
+        cur = data.get("model_context")
+        cur = dict(cur) if isinstance(cur, dict) else {}
+        key = str(model or "").strip()
+        if not key:
+            raise ValueError("model required")
+        if label in (None, "", 0):
+            cur.pop(key, None)
+        elif isinstance(label, int) and not isinstance(label, bool):
+            if label <= 0:
+                raise ValueError("tokens must be positive")
             cur[key] = int(label)
         else:
-            cur[key] = label[:12]
-    data["model_context"] = cur
-    save(accounts_dir, data)
-    return cur
+            label = str(label).strip()
+            if label.isdigit() and int(label) > 0:
+                cur[key] = int(label)
+            else:
+                cur[key] = label[:12]
+        data["model_context"] = cur
+        save(accounts_dir, data)
+        return cur
+
 
 def tool_echo_mode(accounts_dir):
     """面板可切换的「工具协议残片收尾策略」（issue #135）；默认空=跟随环境/内置。"""
@@ -239,14 +241,15 @@ def tool_echo_mode(accounts_dir):
 
 def set_tool_echo_mode(accounts_dir, mode):
     """写入收尾策略；传空串表示清除（回落到环境变量/内置默认）。"""
-    data = load(accounts_dir)
-    val = str(mode or "").strip().lower()
-    if val in ("strict", "lenient"):
-        data["tool_echo_mode"] = val
-    else:
-        data.pop("tool_echo_mode", None)
-    save(accounts_dir, data)
-    return tool_echo_mode(accounts_dir)
+    with _lock:
+        data = _load_for_update(accounts_dir)
+        val = str(mode or "").strip().lower()
+        if val in ("strict", "lenient"):
+            data["tool_echo_mode"] = val
+        else:
+            data.pop("tool_echo_mode", None)
+        save(accounts_dir, data)
+        return tool_echo_mode(accounts_dir)
 
 
 def anthropic_thinking(accounts_dir):
@@ -257,14 +260,16 @@ def anthropic_thinking(accounts_dir):
 
 def set_anthropic_thinking(accounts_dir, mode):
     """设置全局 Anthropic thinking 输出策略；传空串清除（回落到环境变量）。"""
-    data = load(accounts_dir)
-    val = str(mode or "").strip().lower()
-    if val in ("empty", "off"):
-        data["anthropic_thinking"] = val
-    else:
-        data.pop("anthropic_thinking", None)
-    save(accounts_dir, data)
-    return anthropic_thinking(accounts_dir)
+    with _lock:
+        data = _load_for_update(accounts_dir)
+        val = str(mode or "").strip().lower()
+        if val in ("empty", "off"):
+            data["anthropic_thinking"] = val
+        else:
+            data.pop("anthropic_thinking", None)
+        save(accounts_dir, data)
+        return anthropic_thinking(accounts_dir)
+
 
 def _clean_account_selectors(value, allow_empty=False):
     """Keep selectors deterministic; malformed restrictions must not fail open."""
@@ -361,7 +366,7 @@ def set_api_keys(accounts_dir, keys):
             if entry and entry["key"] not in seen:
                 seen.add(entry["key"])
                 cleaned.append(entry)
-        data = load(accounts_dir)
+        data = _load_for_update(accounts_dir)
         data["api_keys"] = cleaned
         # The single-key fields are now derived; drop them so there is one
         # source of truth and the list survives a restart.
@@ -407,7 +412,7 @@ def auth_disabled(accounts_dir):
 
 def set_auth_disabled(accounts_dir, disabled):
     with _lock:
-        data = load(accounts_dir)
+        data = _load_for_update(accounts_dir)
         data["auth_disabled"] = bool(disabled)
         save(accounts_dir, data)
 
@@ -427,22 +432,14 @@ def identity_guard(accounts_dir):
 
 def set_identity_guard(accounts_dir, enabled):
     with _lock:
-        data = load(accounts_dir)
+        data = _load_for_update(accounts_dir)
         data["identity_guard"] = bool(enabled)
         save(accounts_dir, data)
 
 
 def set_omit_default_system_prompt(accounts_dir, enabled):
     with _lock:
-        try:
-            with open(settings_path(accounts_dir), encoding="utf-8") as fh:
-                data = json.load(fh)
-        except FileNotFoundError:
-            data = {}
-        except (ValueError, UnicodeError) as exc:
-            raise OSError("settings.json is invalid; refusing to overwrite it") from exc
-        if not isinstance(data, dict):
-            raise OSError("settings.json must contain an object; refusing to overwrite it")
+        data = _load_for_update(accounts_dir)
         data["omit_default_system_prompt"] = enabled
         save(accounts_dir, data)
 
@@ -461,11 +458,17 @@ def web_tools_environment():
 def _load_for_update(accounts_dir):
     """A failed read is not a fresh install; never replace unreadable settings."""
     try:
-        with open(settings_path(accounts_dir), encoding="utf-8") as fh:
-            data = json.load(fh)
+        with open(settings_path(accounts_dir), encoding="utf-8-sig") as fh:
+            text = fh.read()
     except FileNotFoundError:
         return {}
-    except (ValueError, UnicodeError) as exc:
+    except UnicodeError as exc:
+        raise OSError("settings.json is not valid text; refusing to overwrite it") from exc
+    if not text.strip():
+        return {}      # no content at all: nothing can be lost by starting fresh
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
         raise OSError("settings.json is invalid; refusing to overwrite it") from exc
     if not isinstance(data, dict):
         raise OSError("settings.json must contain an object; refusing to overwrite it")
@@ -629,7 +632,7 @@ def set_banned_models(accounts_dir, value):
     """落盘全局封禁列表（清洗后存储；空 = 不封禁任何模型）。返回清洗结果。"""
     patterns = _clean_model_patterns(value)
     with _lock:
-        data = load(accounts_dir)
+        data = _load_for_update(accounts_dir)
         data["banned_models"] = patterns
         save(accounts_dir, data)
     return patterns
@@ -883,7 +886,7 @@ def set_limit(accounts_dir, key, scope, value):
     if scope not in LIMIT_SCOPES:
         raise ValueError("unknown scope: %s" % scope)
     with _lock:
-        data = load(accounts_dir)
+        data = _load_for_update(accounts_dir)
         raw = data.get(LIMITS_KEY)
         limits = _normalize_limits(raw if isinstance(raw, dict) else {})
         entry = limits[key]
